@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package demo.v1;
+
+message UserId {
+  string value = 1;
+}
+
+service UserService {
+  rpc NormalizeUser (UserId) returns (UserId);
+}

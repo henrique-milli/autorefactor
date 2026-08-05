@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package demo.v1;
+
+message UserId {
+  string value = 1;
+}
+
+service UserService {
+  rpc NormalizeUser (UserId) returns (UserId);
+  rpc MergeScores (MergeScoresRequest) returns (MergeScoresResponse);
+}
+
+message MergeScoresRequest {
+  map<string, double> left = 1;
+  map<string, double> right = 2;
+}
+
+message MergeScoresResponse {
+  map<string, double> scores = 1;
+}
