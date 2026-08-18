@@ -124,24 +124,13 @@ def behavior_sensitive_dedup(changeset: Changeset) -> bool:
 
 
 def placement_risk_move(changeset: Changeset) -> bool:
-    """Move into data/DTO types or public service methods needs HITL."""
+    """Move into data/DTO types that inject persistence/repository dependencies."""
     if (changeset.action or "").strip().lower() != "move":
         return False
     blob = _changeset_text_blob(changeset)
-    if _PERSISTENCE_DEP.search(blob) and _DATA_DTO_TARGET.search(blob):
-        return True
-    blob_l = blob.lower()
-    if any(tok in blob_l for tok in ("serviceimpl", "/service/", " public service")):
-        return True
-    for target in changeset.targets or []:
-        sym = (target.symbol or "").lower()
-        path = (target.path or "").replace("\\", "/").lower()
-        simple = sym.rsplit(".", 1)[-1]
-        if simple.endswith("service") or "serviceimpl" in simple:
-            return True
-        if "/service/" in path:
-            return True
-    return False
+    if not _PERSISTENCE_DEP.search(blob):
+        return False
+    return bool(_DATA_DTO_TARGET.search(blob))
 
 
 def _low_confidence_hitl(changeset: Changeset, min_confidence: float) -> bool:
@@ -260,9 +249,14 @@ def blast_radius_hitl(changeset: Changeset) -> bool:
     return False
 
 
-def ensure_tests_padding_hitl(changeset: Changeset) -> bool:
-    """All ensure_tests prep requires HITL — never auto_proceed."""
-    return (changeset.action or "").strip().lower() == "ensure_tests"
+def ensure_tests_padding_hitl(
+    changeset: Changeset,
+    min_confidence: float = _DEFAULT_AUTORUN_THRESHOLD,
+) -> bool:
+    """Low-confidence ensure_tests still HITL; high-confidence prep autoruns."""
+    if (changeset.action or "").strip().lower() != "ensure_tests":
+        return False
+    return float(changeset.confidence) < float(min_confidence)
 
 
 def architectural_wiring_hitl(changeset: Changeset) -> bool:
@@ -339,23 +333,21 @@ def changeset_needs_hitl(
     deps_satisfied: bool = True,
     queue: list[Changeset] | None = None,
 ) -> tuple[bool, str | None]:
-    """Shared autorun vs HITL gate used by next_pending and queue counts."""
+    """Shared autorun vs HITL gate used by next_pending and queue counts.
+
+    Unsatisfied deps are waiting (``blocked_deps``), not a user confirmation.
+    High-confidence items auto-proceed unless a real judgment kind applies.
+    """
     if not deps_satisfied:
-        return True, "blocked_deps"
+        return False, "blocked_deps"
     if security_sensitive_hitl(changeset):
         return True, "security_sensitive"
     if slop_kind_hitl(changeset):
         return True, "slop_sensitive"
     if self_merge_hitl(changeset):
         return True, "self_merge"
-    if blast_radius_hitl(changeset):
-        return True, "blast_radius"
-    if queue and uncovered_structural_hitl(changeset, queue):
-        return True, "uncovered_structural"
     if architectural_wiring_hitl(changeset):
         return True, "architectural_wiring"
-    if ensure_tests_padding_hitl(changeset):
-        return True, "ensure_tests"
     if queue and unwired_handler_structural_hitl(changeset, queue):
         return True, "wiring_blocked_structural"
     if framework_sensitive_split(changeset):
@@ -384,12 +376,13 @@ def hitl_questions_for_reason(
     if reason == "blocked_deps":
         deps = ", ".join(unmet_deps or [])
         return [
-            f"Blocked: waiting for dependencies to complete: {deps}.",
-            f"'{changeset.title}' ({changeset.action}) cannot proceed until prep is done.",
+            f"Waiting: dependencies not done yet: {deps}.",
+            f"'{changeset.title}' ({changeset.action}) cannot apply until prep is complete.",
+            "This is not a confirmation prompt — drain or skip the blocking prep item first.",
         ]
     if reason == "ensure_tests":
         return [
-            "ensure_tests prep requires human confirmation (never auto_proceed).",
+            "Low-confidence ensure_tests prep — confirm before scaffolding tests.",
             f"Proceed with '{changeset.title}' ({changeset.action})?",
             "Reply yes to continue, skip to skip, or provide guidance.",
         ]
@@ -556,7 +549,7 @@ class ChangesetStore:
             unmet = [d for d in (chosen.depends_on or []) if d not in ids_done]
             return NextChangesetResult(
                 changeset=chosen,
-                needs_confirmation=True,
+                needs_confirmation=False,
                 hitl_reason="blocked_deps",
                 questions=hitl_questions_for_reason(
                     chosen, min_confidence, "blocked_deps", unmet_deps=unmet

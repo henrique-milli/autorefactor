@@ -6,6 +6,14 @@ Default shape is **cartesian**: every iteration walks **all user personas × all
 
 **Green retest means spec probes passed on every episode**, not a lone `1.00` from the first repo or an optional Cursor scorer. Leftover sampled changeset IDs are **notes** (`sticky_ids`); they do not fail the run. Later critic walks see the last episode’s probe counts (`ensure_tests_count`) so they cannot re-file a miss the harness already measured closed.
 
+Eval probes check **spec acceptance** (prep exists, secrets stay HITL) — not sticky changeset ids and not “every `ensure_tests` is HITL.”
+
+## Critics are OSS-user simulations
+
+User personas clone this product, point MCP at **their** subject tree, and judge whether the queue is usable. The harness copies `docs/product-goal.md`, a README quickstart excerpt, and a tiny `product_index.md` into `.autorefactor-context/` (ignored by the snapshot/evidence gate). Critics **Read 1–2 cited subject files** and compare briefs vs code. They must not write subject or product files. Coverage-purist judges prep quality/ordering; confidence-skeptic judges **wrong** auto_proceed — not high-conf splits and not “never autorun.”
+
+**Triage may not ship always-HITL.** Accept goal-aligned patches (usable autorun, honest report, prep order, real slop/secret HITL). Reject extra confirm gates, confidence caps as judgment, playbook essays, and subject bugs without a queue/report miss.
+
 ## Cycle (honest)
 
 1. **Ensure engine**: `docker compose up -d --build autorefactor` + health (no manual compose needed).

@@ -86,6 +86,7 @@ def test_sample_queue_splits_auto_and_hitl_without_mutating(
     assert all(i["needs_confirmation"] for i in sampled["hitl_sample"])
     assert sampled["hitl_burden"]["pending_hitl"] >= 2
     assert sampled["hitl_burden"]["pending_autorun"] >= 2
+    assert sampled["hitl_burden"]["pending_waiting"] == 0
     assert 0 <= sampled["hitl_burden"]["ratio"] <= 1
     assert "hitl_digest" in sampled["hitl_sample"][0]
     after = [c.status for c in load_queue(out)]
@@ -115,3 +116,36 @@ def test_get_status_includes_hitl_burden(
     assert status["hitl_burden"]["pending"] == 2
     assert status["hitl_burden"]["pending_hitl"] >= 1
     assert status["queue_counts"]["pending"] == 2
+
+
+def test_sample_queue_waiting_deps_are_not_hitl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+    prep = _cs(cid="prep1", title="Ensure tests", action="ensure_tests", confidence=0.78)
+    blocked = Changeset(
+        id="split1",
+        title="Split helper",
+        action="split",
+        brief="brief for split1",
+        rationale="r",
+        confidence=0.99,
+        targets=[ChangesetTarget(repo="r", path="a.py", symbol="f", unit_id="u1")],
+        depends_on=["prep1"],
+    )
+    save_queue(out, [prep, blocked])
+    _patch_ws(monkeypatch, ws, out)
+    monkeypatch.setattr(T, "_prep_units_unresolved", lambda *_a, **_k: (False, []))
+    sampled = tool_sample_queue(out=str(out), workspace=str(ws), hitl_limit=3)
+    assert sampled["ok"] is True
+    assert sampled["hitl_burden"]["pending_waiting"] == 1
+    assert sampled["hitl_burden"]["pending_hitl"] == 0
+    sample_ids = [i["id"] for i in sampled["auto_sample"]] + [
+        i["id"] for i in sampled["hitl_sample"]
+    ]
+    assert "split1" not in sample_ids
+    assert sampled["auto_sample"][0]["id"] == "prep1"
+    assert sampled["auto_sample"][0]["auto_proceed"] is True

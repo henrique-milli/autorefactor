@@ -637,7 +637,7 @@ def _queue_counts(
     if items is None:
         items = load_queue(out_dir)
     done = skipped = blocked = pending = 0
-    pending_autorun = pending_hitl = 0
+    pending_autorun = pending_hitl = pending_waiting = 0
     ids_done = {c.id for c in items if c.status == ChangesetStatus.DONE}
     for c in items:
         st = c.status
@@ -653,7 +653,9 @@ def _queue_counts(
             needs_hitl, _reason = changeset_needs_hitl(
                 c, threshold, deps_satisfied=deps_ok, queue=items
             )
-            if needs_hitl:
+            if not deps_ok:
+                pending_waiting += 1
+            elif needs_hitl:
                 pending_hitl += 1
             else:
                 pending_autorun += 1
@@ -661,6 +663,7 @@ def _queue_counts(
         "pending": pending,
         "pending_autorun": pending_autorun,
         "pending_hitl": pending_hitl,
+        "pending_waiting": pending_waiting,
         "done": done,
         "skipped": skipped,
         "blocked": blocked,
@@ -671,10 +674,12 @@ def _hitl_burden(counts: dict[str, int]) -> dict[str, float | int]:
     pending = int(counts.get("pending") or 0)
     pending_hitl = int(counts.get("pending_hitl") or 0)
     pending_autorun = int(counts.get("pending_autorun") or 0)
+    pending_waiting = int(counts.get("pending_waiting") or 0)
     return {
         "pending": pending,
         "pending_hitl": pending_hitl,
         "pending_autorun": pending_autorun,
+        "pending_waiting": pending_waiting,
         "ratio": pending_hitl / max(pending, 1),
     }
 
@@ -693,7 +698,7 @@ def _sample_queue_item(
         "confidence": cs.confidence,
         "status": cs.status.value,
         "needs_confirmation": needs_confirmation,
-        "auto_proceed": not needs_confirmation,
+        "auto_proceed": (not needs_confirmation) and hitl_reason != "blocked_deps",
         "hitl_reason": hitl_reason,
         "hitl_digest": _hitl_digest(cs, threshold),
         "brief": cs.brief,
@@ -721,10 +726,12 @@ def _prep_units_unresolved(out_dir: Path, cs) -> tuple[bool, list[str]]:  # noqa
 
 
 def _peek_loop(out_dir: Path, *, threshold: float) -> str:
-    """What the agent should do next after the current item: autorun | hitl | done."""
+    """What the agent should do next after the current item: autorun | hitl | waiting | done."""
     result = _queue_store(out_dir).next_pending(min_confidence=threshold)
     if result.done or result.changeset is None:
         return "done"
+    if result.hitl_reason == "blocked_deps":
+        return "waiting"
     if result.needs_confirmation:
         return "hitl"
     return "autorun"
@@ -735,10 +742,13 @@ def _loop_payload(
     *,
     threshold: float,
     current_auto_proceed: bool | None = None,
+    current_waiting: bool = False,
 ) -> dict[str, Any]:
     """Attach loop + queue_counts. current_auto_proceed forces loop for the active item."""
     counts = _queue_counts(out_dir, threshold=threshold)
-    if current_auto_proceed is True:
+    if current_waiting:
+        loop = "waiting"
+    elif current_auto_proceed is True:
         loop = "autorun"
     elif current_auto_proceed is False:
         loop = "hitl"
@@ -786,6 +796,8 @@ def tool_sample_queue(
         if unresolved:
             needs_hitl = True
             reason = reason or "units_unresolved"
+        if not deps_ok:
+            continue
         if needs_hitl:
             hitl_items.append((c, reason))
         else:
@@ -937,10 +949,13 @@ def tool_get_next_changeset(
     unresolved, target_paths = _prep_units_unresolved(out_dir, cs)
     if unresolved:
         needs_confirmation = True
-    auto_proceed = not needs_confirmation
     hitl_reason = result.hitl_reason
+    waiting = hitl_reason == "blocked_deps" and not unresolved
+    if waiting:
+        needs_confirmation = False
     if unresolved and not hitl_reason:
         hitl_reason = "units_unresolved"
+    auto_proceed = (not needs_confirmation) and not waiting
     digest = _hitl_digest(cs, threshold)
     if unresolved:
         paths_note = ", ".join(f"`{p}`" for p in target_paths) or "(no targets)"
@@ -958,14 +973,20 @@ def tool_get_next_changeset(
         threshold=threshold,
     )
     questions: list[str] = []
-    if needs_confirmation:
+    if needs_confirmation or waiting:
         questions = list(result.questions) if result.questions else [
             f"Confidence {cs.confidence:.2f} is below threshold {threshold:.2f}.",
             "Proceed with this changeset, skip it, or mark blocked?",
         ]
         questions.insert(0, digest)
     action_l = (cs.action or "").strip().lower()
-    if auto_proceed:
+    if waiting:
+        next_step = (
+            "loop=waiting: dependencies are not done. Do not confirm_changeset(proceed) "
+            "and do not ask the user to confirm this item. Drain or skip the blocking "
+            "prep changeset first, then call get_next_changeset again."
+        )
+    elif auto_proceed:
         next_step = (
             "loop=autorun: Do not ask the user. Call confirm_changeset(decision=proceed) "
             "without asking, apply the refactor, mark_changeset done, then immediately "
@@ -1029,7 +1050,12 @@ def tool_get_next_changeset(
         cs = _patch_changeset(store, cs.id, metrics_delta=merged_metrics)
         payload["changeset"] = cs.model_dump(mode="json")
     payload.update(
-        _loop_payload(out_dir, threshold=threshold, current_auto_proceed=auto_proceed)
+        _loop_payload(
+            out_dir,
+            threshold=threshold,
+            current_auto_proceed=auto_proceed,
+            current_waiting=waiting,
+        )
     )
     return payload
 
@@ -1132,12 +1158,12 @@ def _hitl_confirm_choice(
     if reason in {"ensure_tests"}:
         return {
             "id": "confirm_ensure_tests",
-            "label": "ensure_tests prep requires confirmation — confirm briefly with the user",
+            "label": "Low-confidence ensure_tests prep — confirm before scaffolding tests",
         }
     if reason == "blocked_deps":
         return {
-            "id": "confirm_blocked_deps",
-            "label": "Blocked on dependencies — confirm how to proceed",
+            "id": "waiting_blocked_deps",
+            "label": "Waiting on prep — drain or skip the blocking item; this is not a confirm",
         }
     if reason == "placement_risk":
         return {

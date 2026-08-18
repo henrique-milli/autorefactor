@@ -28,6 +28,7 @@ _SKIP_DIR_NAMES = frozenset(
         ".mypy_cache",
         ".pytest_cache",
         ".autorefactor-data",
+        ".autorefactor-context",
         "out",
     }
 )
@@ -159,6 +160,12 @@ def verify_lifecycle_evidence(
     checks["claimed_edits"] = claimed_edits
     checks["actual_changed_files"] = actual[:50]
     checks["actual_changed_count"] = len(actual)
+    reads = [
+        str(p).replace("\\", "/").lstrip("./")
+        for p in (lifecycle.get("subject_files_read") or [])
+        if p
+    ]
+    checks["subject_files_read"] = reads
 
     if actual:
         reasons.append("must_not_edit_subject")

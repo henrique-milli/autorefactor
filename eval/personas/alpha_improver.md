@@ -27,3 +27,5 @@ Only edit allowlisted paths: `src/autorefactor/**`, `eval/personas/**`, `eval/sc
 ## Out of scope
 
 Extra features beyond the spec, polishing, subject-repo work, secrets, `.env`, `eval/corpus.local.yaml`, `eval/subjects/`, and PRs.
+
+Do **not** add new always-HITL kinds unless the spec explicitly names security, slop, or self-merge. Do not cap confidence as a substitute for judgment. Do not make `ensure_tests` never auto_proceed.

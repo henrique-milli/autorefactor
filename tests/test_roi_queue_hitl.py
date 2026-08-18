@@ -1036,16 +1036,35 @@ def test_slop_kinds_and_public_service_move_require_hitl() -> None:
             )
         ],
     )
+    dto_move = Changeset(
+        id="dto-persist",
+        title="Move helper into BonusData",
+        action="move",
+        brief="injects BonusRepository into AggregatedBonusData DTO",
+        rationale="placement into data type with persistence",
+        confidence=0.91,
+        targets=[
+            ChangesetTarget(
+                repo="janus-bonus",
+                path="src/main/java/com/example/dto/AggregatedBonusData.java",
+                symbol="com.example.dto.AggregatedBonusData",
+            )
+        ],
+    )
 
     for cs, reason in (
         (secret, "security_sensitive"),
         (disabled, "slop_sensitive"),
         (draft, "slop_sensitive"),
-        (move, "placement_risk"),
+        (dto_move, "placement_risk"),
     ):
         needs, hitl_reason = changeset_needs_hitl(cs, 0.6)
         assert needs is True
         assert hitl_reason == reason
+
+    needs, reason = changeset_needs_hitl(move, 0.6)
+    assert needs is False
+    assert reason is None
 
 
 def test_batched_document_followups_collapse_many_siblings() -> None:
@@ -1137,8 +1156,8 @@ def test_self_merge_and_uncovered_structural_require_hitl() -> None:
         metrics_delta={"needs_coverage": True, "coverage_index_empty": True},
     )
     needs, reason = changeset_needs_hitl(split, 0.6, queue=[split])
-    assert needs is True
-    assert reason == "uncovered_structural"
+    assert needs is False
+    assert reason != "uncovered_structural"
 
     ensure = Changeset(
         id="prep1",
@@ -1154,7 +1173,7 @@ def test_self_merge_and_uncovered_structural_require_hitl() -> None:
     needs, reason = changeset_needs_hitl(
         split_with_prep, 0.6, deps_satisfied=False, queue=[split_with_prep, ensure]
     )
-    assert needs is True
+    assert needs is False
     assert reason == "blocked_deps"
 
     extract = Changeset(
@@ -1170,6 +1189,194 @@ def test_self_merge_and_uncovered_structural_require_hitl() -> None:
         ],
     )
     needs, reason = changeset_needs_hitl(extract, 0.6)
-    assert needs is True
-    assert reason == "blast_radius"
+    assert needs is False
+    assert reason != "blast_radius"
+
+
+def test_janus_bonus_shape_autorun_and_waiting(tmp_path: Path) -> None:
+    from autorefactor.changesets.store import ChangesetStore, changeset_needs_hitl
+    from autorefactor.mcp.tools import _queue_counts
+
+    preps = [
+        Changeset(
+            id=f"prep{i}",
+            title=f"Ensure tests {i}",
+            action="ensure_tests",
+            brief="characterization coverage",
+            rationale="prep",
+            confidence=0.78 if i == 0 else 0.72,
+            targets=[
+                ChangesetTarget(
+                    repo="janus-bonus",
+                    path=f"src/main/java/H{i}.java",
+                    symbol=f"com.example.H{i}",
+                )
+            ],
+        )
+        for i in range(9)
+    ]
+    splits = [
+        Changeset(
+            id="split-hi-99",
+            title="Split high 0.99",
+            action="split",
+            brief="b",
+            rationale="r",
+            confidence=0.99,
+            depends_on=["prep0"],
+            targets=[
+                ChangesetTarget(
+                    repo="janus-bonus", path="src/main/java/A.java", symbol="A.m"
+                )
+            ],
+        ),
+        Changeset(
+            id="split-hi-83",
+            title="Split high 0.83",
+            action="split",
+            brief="b",
+            rationale="r",
+            confidence=0.83,
+            depends_on=["prep1"],
+            targets=[
+                ChangesetTarget(
+                    repo="janus-bonus", path="src/main/java/B.java", symbol="B.m"
+                )
+            ],
+        ),
+        Changeset(
+            id="split-hi-73",
+            title="Split high 0.73",
+            action="split",
+            brief="b",
+            rationale="r",
+            confidence=0.73,
+            depends_on=["prep2"],
+            targets=[
+                ChangesetTarget(
+                    repo="janus-bonus", path="src/main/java/C.java", symbol="C.m"
+                )
+            ],
+        ),
+        Changeset(
+            id="split-lo-54",
+            title="Split low 0.54",
+            action="split",
+            brief="b",
+            rationale="r",
+            confidence=0.54,
+            depends_on=["prep3"],
+            targets=[
+                ChangesetTarget(
+                    repo="janus-bonus", path="src/main/java/D.java", symbol="D.m"
+                )
+            ],
+        ),
+        Changeset(
+            id="split-slop",
+            title="Split ConfigurationValidator",
+            action="split",
+            brief="re-enable startup validation",
+            rationale="disabled_startup_validation",
+            confidence=0.79,
+            depends_on=["prep4"],
+            targets=[
+                ChangesetTarget(
+                    repo="janus-bonus",
+                    path="src/main/java/ConfigurationValidator.java",
+                    symbol="ConfigurationValidator",
+                )
+            ],
+            metrics_delta={"kind": "disabled_startup_validation"},
+        ),
+        Changeset(
+            id="extract-slop",
+            title="Extract shared draft map",
+            action="extract_shared",
+            brief="draft in-memory mapping",
+            rationale="draft_in_memory_map",
+            confidence=0.76,
+            depends_on=["prep5"],
+            targets=[
+                ChangesetTarget(
+                    repo="janus-bonus",
+                    path="src/main/java/MappingService.java",
+                    symbol="MappingService",
+                )
+            ],
+            metrics_delta={"kind": "draft_in_memory_map"},
+        ),
+    ]
+    self_merge = Changeset(
+        id="merge-self",
+        title="Merge duplicate fill overloads",
+        action="merge",
+        brief="identical qualified symbol on both targets",
+        rationale="dedup",
+        confidence=0.99,
+        targets=[
+            ChangesetTarget(
+                repo="janus-bonus", path="src/main/java/A.java", symbol="com.example.A.fill"
+            ),
+            ChangesetTarget(
+                repo="janus-bonus", path="src/main/java/A.java", symbol="com.example.A.fill"
+            ),
+        ],
+    )
+    items = [*preps, *splits, self_merge]
+
+    waiting_ids = {c.id for c in splits}
+    for cs in items:
+        deps_ok = not cs.depends_on
+        needs, reason = changeset_needs_hitl(cs, 0.6, deps_satisfied=deps_ok, queue=items)
+        if cs.id in waiting_ids:
+            assert needs is False
+            assert reason == "blocked_deps"
+        elif cs.action == "ensure_tests":
+            assert needs is False
+        elif cs.id == "merge-self":
+            assert needs is True
+            assert reason == "self_merge"
+
+    counts = _queue_counts(tmp_path / "out", threshold=0.6, items=items)
+    assert counts["pending"] == len(items)
+    assert counts["pending_waiting"] == len(splits)
+    assert counts["pending_hitl"] == 1
+    assert counts["pending_autorun"] == len(preps)
+    assert counts["pending_hitl"] / counts["pending"] < 0.5
+
+    store = ChangesetStore(tmp_path / "queue.json")
+    store.save(items)
+    nxt = store.next_pending(min_confidence=0.6)
+    assert nxt.changeset is not None
+    assert nxt.changeset.action == "ensure_tests"
+    assert nxt.needs_confirmation is False
+
+    done_preps = [
+        c.model_copy(update={"status": ChangesetStatus.DONE}) for c in preps
+    ]
+    ready_items = [*done_preps, *splits, self_merge]
+    for cid, expect_hitl, expect_reason in (
+        ("split-hi-99", False, None),
+        ("split-hi-83", False, None),
+        ("split-hi-73", False, None),
+        ("split-lo-54", True, "low_confidence"),
+        ("split-slop", True, "slop_sensitive"),
+        ("extract-slop", True, "slop_sensitive"),
+        ("merge-self", True, "self_merge"),
+    ):
+        cs = next(c for c in ready_items if c.id == cid)
+        needs, reason = changeset_needs_hitl(
+            cs, 0.6, deps_satisfied=True, queue=ready_items
+        )
+        assert needs is expect_hitl, cid
+        if expect_reason:
+            assert reason == expect_reason, cid
+        else:
+            assert reason is None, cid
+
+    ready_counts = _queue_counts(tmp_path / "out", threshold=0.6, items=ready_items)
+    assert ready_counts["pending_waiting"] == 0
+    assert ready_counts["pending_autorun"] == 3
+    assert ready_counts["pending_hitl"] == 4
 

@@ -26,6 +26,11 @@
           "type": "array",
           "items": { "type": "string" }
         },
+        "subject_files_read": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Subject paths the critic opened (read-only); optional"
+        },
         "subject_files_edited": {
           "type": "array",
           "items": { "type": "string" }

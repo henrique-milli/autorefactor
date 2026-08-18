@@ -55,6 +55,62 @@ HITL_SAMPLE_MIN = 1
 HITL_SAMPLE_MAX = 3
 DEFAULT_ALPHA_TIMEOUT_S = 300.0
 
+CRITIC_CONTEXT_DIR = ".autorefactor-context"
+_PRODUCT_INDEX_LINES = (
+    (
+        "src/autorefactor/changesets/store.py",
+        "Queue HITL vs autorun gates (changeset_needs_hitl, blocked_deps waiting).",
+    ),
+    (
+        "src/autorefactor/plan/followups.py",
+        "Prep follow-ups: ensure_tests / document ordering ahead of structural work.",
+    ),
+    (
+        "src/autorefactor/mcp/guidance.py",
+        "Agent playbook: phase CTAs; HITL only on needs_confirmation.",
+    ),
+)
+
+
+def _product_goal_text(repo_root: Path | None = None) -> str:
+    root = repo_root or _repo_root()
+    path = root / "docs" / "product-goal.md"
+    if path.is_file():
+        return path.read_text(encoding="utf-8").strip()
+    return ""
+
+
+def _readme_quickstart_excerpt(readme: Path) -> str:
+    if not readme.is_file():
+        return ""
+    lines = readme.read_text(encoding="utf-8").splitlines()
+    start = next((i for i, line in enumerate(lines) if line.strip() == "## Quickstart"), None)
+    if start is None:
+        return "\n".join(lines[:80]).strip() + "\n"
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("## ") and not lines[j].startswith("###"):
+            end = j
+            break
+    return "\n".join(lines[start:end]).strip() + "\n"
+
+
+def install_critic_context_pack(workspace: Path, repo_root: Path) -> Path:
+    """Copy product-goal + README excerpt + index into the walk dir (ignored by evidence)."""
+    dest = workspace / CRITIC_CONTEXT_DIR
+    dest.mkdir(parents=True, exist_ok=True)
+    goal = _product_goal_text(repo_root)
+    if goal:
+        (dest / "product-goal.md").write_text(goal + "\n", encoding="utf-8")
+    excerpt = _readme_quickstart_excerpt(repo_root / "README.md")
+    if excerpt:
+        (dest / "readme-quickstart.md").write_text(excerpt, encoding="utf-8")
+    index_lines = ["# Product index", ""]
+    for rel, one_line in _PRODUCT_INDEX_LINES:
+        index_lines.append(f"- `{rel}` — {one_line}")
+    (dest / "product_index.md").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
+    return dest
+
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
@@ -357,6 +413,10 @@ def _critic_prompt(
         "Trust get_status / get_report unless they show the run is not ready.\n"
         "Mission: evaluate this analyzed product via MCP (status, report, sample_queue "
         f"with 1 autorun brief + {HITL_SAMPLE_MIN}–{HITL_SAMPLE_MAX} HITL briefs). "
+        "Read `.autorefactor-context/` (product-goal.md, product_index.md, README excerpt) "
+        "when filing product_surface findings. Open 1–2 cited subject files (Read) and "
+        "compare brief vs code. Findings need evidence.path (subject) and/or changeset_id. "
+        "Forbidden: always HITL / never auto_proceed ensure_tests. "
         "Success is product-surface evidence in feedback.json, not a subject rebuild.\n"
         + memory
         + out_line
@@ -371,6 +431,7 @@ def _triage_prompt(
     persona: str,
     iteration: int,
     product_use_ok: bool,
+    product_goal: str = "",
 ) -> str:
     gate = (
         "Feedback gate: OK (hard evidence passed)."
@@ -381,8 +442,12 @@ def _triage_prompt(
             "stop_reason=feedback_not_from_product_use."
         )
     )
+    goal_block = ""
+    if product_goal.strip():
+        goal_block = "Product goal (in-scope vs out-of-scope):\n\n" + product_goal.strip() + "\n\n"
     return (
         f"{persona}\n\n"
+        f"{goal_block}"
         f"Self-improve iteration: {iteration}.\n"
         f"{gate}\n"
         "Feedback is merged from multiple personas and episodes; findings may include "
@@ -390,6 +455,10 @@ def _triage_prompt(
         f"Critic feedback file: `{feedback_path}`.\n"
         "Mission: turn sample-walk findings into at most "
         f"{MAX_ALPHA_CHANGES} allowlisted product changes, highest-severity first.\n"
+        "Accept findings that restore usable autorun, honest status/report, prep ordering, "
+        "or real slop/secret HITL. Reject (drop the finding or write changes=[]) more "
+        "always-HITL, confidence caps as a substitute for judgment, playbook essays, "
+        "and subject bugs without a queue/report miss.\n"
         "Success is `alpha_spec.json` at the repository root. "
         "Out of scope: subject-repo work and extra features beyond the findings.\n"
     )
@@ -807,6 +876,7 @@ def run_stimulus_critic(
         subjects_dir=eval_dir / "subjects",
         mode=mode,
     )
+    install_critic_context_pack(workspace, repo_root)
     write_snapshot(workspace)
 
     lock_path = eval_dir / "artifacts" / ".engine.lock"
@@ -1275,6 +1345,7 @@ def _run_self_improve_loop_body(
                         persona=_read_persona(eval_dir, "triage_alpha.md"),
                         iteration=i,
                         product_use_ok=product_use_ok,
+                        product_goal=_product_goal_text(root),
                     ),
                     cwd=root,
                     model=model,

@@ -88,17 +88,39 @@ def test_delete_duplicate_at_threshold_requires_hitl(tmp_path: Path) -> None:
     assert nxt2.needs_confirmation is True
 
 
-def test_ensure_tests_always_requires_hitl(tmp_path: Path) -> None:
+def test_high_confidence_ensure_tests_autoruns(tmp_path: Path) -> None:
     from autorefactor.changesets.store import ChangesetStore, ensure_tests_padding_hitl
 
     cs = Changeset(
         id="mock-only",
         title="Ensure tests for PamClientException",
         action="ensure_tests",
-        brief="Ask the user before applying (HITL).",
-        rationale="mock-only Java suite",
+        brief="Characterization coverage for BonusExceptionHandler.",
+        rationale="prep",
         confidence=0.90,
         metrics_delta={"kind": "test_quality"},
+    )
+    assert ensure_tests_padding_hitl(cs) is False
+    assert ensure_tests_padding_hitl(cs, 0.6) is False
+
+    store = ChangesetStore(tmp_path / "queue.json")
+    store.save([cs])
+    nxt = store.next_pending(min_confidence=0.60)
+    assert nxt.changeset is not None
+    assert nxt.changeset.id == "mock-only"
+    assert nxt.needs_confirmation is False
+
+
+def test_low_confidence_ensure_tests_requires_hitl(tmp_path: Path) -> None:
+    from autorefactor.changesets.store import ChangesetStore, ensure_tests_padding_hitl
+
+    cs = Changeset(
+        id="low-prep",
+        title="Ensure tests for unknown unit",
+        action="ensure_tests",
+        brief="Ask the user before applying (HITL).",
+        rationale="weak prep",
+        confidence=0.40,
     )
     assert ensure_tests_padding_hitl(cs) is True
 
@@ -106,8 +128,8 @@ def test_ensure_tests_always_requires_hitl(tmp_path: Path) -> None:
     store.save([cs])
     nxt = store.next_pending(min_confidence=0.60)
     assert nxt.changeset is not None
-    assert nxt.changeset.id == "mock-only"
     assert nxt.needs_confirmation is True
+    assert nxt.hitl_reason == "low_confidence"
 
 
 def test_split_at_threshold_auto_proceeds(tmp_path: Path) -> None:

@@ -22,6 +22,8 @@ from ar_eval.loop import (
     _critic_prompt,
     _iteration_timing_payload,
     _write_iteration_timing_json,
+    _triage_prompt,
+    install_critic_context_pack,
     load_user_persona,
     repair_failed_smoke,
     select_episodes_for_iteration,
@@ -1096,6 +1098,46 @@ def test_critic_prompt_is_goal_oriented(tmp_path: Path) -> None:
     assert "do not mark zero/missing ensure_tests prep" in lower
     for ban in ("`mvn", "`pytest", "`npm", "mvn test", "npm test"):
         assert ban not in lower
+    assert ".autorefactor-context" in text
+    assert "product-goal" in lower
+    assert "subject files" in lower
+    assert "never auto_proceed ensure_tests" in lower
+
+
+def test_triage_prompt_rejects_always_hitl(tmp_path: Path) -> None:
+    text = _triage_prompt(
+        feedback_path=tmp_path / "feedback.json",
+        persona="# triage",
+        iteration=1,
+        product_use_ok=True,
+        product_goal="# Product goal\nHigh-confidence auto-proceed.\n",
+    )
+    lower = text.lower()
+    assert "product goal" in lower
+    assert "high-confidence auto-proceed" in lower
+    assert "always-hitl" in lower or "always hitl" in lower
+    assert "reject" in lower
+
+
+def test_critic_context_pack_ignored_by_evidence(tmp_path: Path) -> None:
+    ws = tmp_path / "ep"
+    ws.mkdir()
+    (ws / "a.py").write_text("x=1\n", encoding="utf-8")
+    write_snapshot(ws)
+    repo = tmp_path / "product"
+    (repo / "docs").mkdir(parents=True)
+    (repo / "docs" / "product-goal.md").write_text("# Product goal\nAutorun.\n", encoding="utf-8")
+    (repo / "README.md").write_text("## Quickstart\n\nuv sync\n\n## Other\n", encoding="utf-8")
+    dest = install_critic_context_pack(ws, repo)
+    assert (dest / "product-goal.md").is_file()
+    assert (dest / "product_index.md").is_file()
+    assert "changesets/store.py" in (dest / "product_index.md").read_text(encoding="utf-8")
+    assert changed_files(ws) == []
+    fb = _good_feedback()
+    fb["lifecycle"]["subject_files_read"] = ["a.py"]
+    out = verify_lifecycle_evidence(fb, workspace=ws)
+    assert out["ok"] is True
+    assert out["checks"]["subject_files_read"] == ["a.py"]
 
 
 def test_load_prior_critic_memory_reads_retest_probe(tmp_path: Path) -> None:

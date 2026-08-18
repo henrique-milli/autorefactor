@@ -64,7 +64,8 @@ def build_agent_guidance(config: AutorefactorConfig) -> dict[str, Any]:
             "before changing code. Ask: (1) raise test coverage first?"
             + prep_docs
             + " If no: skip those prep changesets, then continue. If yes: drain prep items "
-            "first (HITL on each). document proceed writes docs"
+            "first (high-confidence auto_proceed; HITL only when needs_confirmation). "
+            "document proceed writes docs"
             + (
                 "; with describe_mode=describe the server applies generated descriptions."
                 if describe == "describe"
@@ -79,6 +80,8 @@ def build_agent_guidance(config: AutorefactorConfig) -> dict[str, Any]:
             "mark_changeset done, immediately fetch the next item — no mid-item CTA.",
             "  • needs_confirmation=true: STOP, show hitl_digest, ask proceed/skip/blocked "
             "before confirm_changeset.",
+            "  • loop=waiting / blocked_deps: not a user question — do not proceed; drain or "
+            "skip the blocking prep item first.",
             "  • Respect depends_on. When queue done=true: report summary + CTA (review UI / stop).",
         ]
     )
