@@ -1,0 +1,9 @@
+# Committed example corpus — fixtures only.
+# Copy to corpus.local.yaml (gitignored) and replace episodes with any local absolute paths.
+episodes:
+  - id: demo-alpha
+    roots:
+      - fixtures/demo-workspace/alpha
+  - id: slop-twins
+    roots:
+      - fixtures/slop-twins

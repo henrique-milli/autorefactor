@@ -1,4 +1,4 @@
-"""Characterization tests for `beta.util.normalize_user_id` (coderazor ensure-tests)."""
+"""Characterization tests for `beta.util.normalize_user_id` (autorefactor ensure-tests)."""
 
 from __future__ import annotations
 

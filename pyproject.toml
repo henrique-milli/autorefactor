@@ -3,16 +3,16 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "coderazor"
-version = "0.1.0"
-description = "coderazor.ai — analysis engine + changeset queue for host agents"
+name = "autorefactor"
+version = "0.0.1"
+description = "autorefactor.ai — multi-goal evidence engine + changeset queue for host agents"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
-authors = [{ name = "coderazor.ai contributors" }]
+authors = [{ name = "autorefactor.ai contributors" }]
 keywords = ["refactoring", "llm", "embeddings", "code-quality", "mcp"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Topic :: Software Development :: Quality Assurance",
@@ -32,26 +32,49 @@ dependencies = [
   "tree-sitter-go>=0.23.0",
   "tree-sitter-typescript>=0.23.0",
   "matplotlib>=3.8.0",
-  "mcp>=1.0.0",
+  "mcp>=1.0.0,<2",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0.0", "ruff>=0.6.0"]
+dev = ["pytest>=8.0.0", "ruff>=0.6.0", "pyyaml>=6.0"]
 analyzers = ["ruff>=0.6.0"]
+eval = ["cursor-sdk>=0.1.0", "pyyaml>=6.0"]
 # System CLIs expected on PATH when enabled: semgrep, eslint, pmd/spotbugs, c8/coverage
 
 [project.scripts]
-coderazor = "coderazor.cli:app"
-coderazor-mcp = "coderazor.mcp.server:main"
+autorefactor = "autorefactor.cli:app"
+autorefactor-mcp = "autorefactor.mcp.server:main"
+ar-eval = "ar_eval.waves:main"
+
+[project.entry-points."autorefactor.sensors"]
+"sim.method" = "autorefactor.sensors.builtins:sim_method"
+"sim.class" = "autorefactor.sensors.builtins:sim_class"
+"sim.fingerprint" = "autorefactor.sensors.builtins:sim_fingerprint"
+slop = "autorefactor.sensors.builtins:slop"
+placement = "autorefactor.sensors.builtins:placement"
+structure = "autorefactor.sensors.builtins:structure"
+complexity = "autorefactor.sensors.builtins:complexity"
+coverage = "autorefactor.sensors.builtins:coverage"
+"test_quality" = "autorefactor.sensors.builtins:test_quality"
+contract = "autorefactor.sensors.builtins:contract"
+cluster = "autorefactor.sensors.builtins:cluster"
+"static.semgrep" = "autorefactor.sensors.builtins:static_semgrep"
+"static.ruff" = "autorefactor.sensors.builtins:static_ruff"
+"static.eslint" = "autorefactor.sensors.builtins:static_eslint"
+"static.java" = "autorefactor.sensors.builtins:static_java"
+wiring = "autorefactor.sensors.builtins:wiring"
+
+[project.entry-points."autorefactor.hints"]
+jvm = "autorefactor.hints.jvm:jvm"
 
 [project.urls]
-Homepage = "https://coderazor.ai"
-Repository = "https://github.com/coderazor-ai/coderazor"
+Homepage = "https://autorefactor.ai"
+Repository = "https://github.com/henrique-milli/autorefactor"
 
 [tool.setuptools.packages.find]
-where = ["src"]
-include = ["coderazor*"]
+where = ["src", "eval/src"]
+include = ["autorefactor*", "ar_eval*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "eval/src"]

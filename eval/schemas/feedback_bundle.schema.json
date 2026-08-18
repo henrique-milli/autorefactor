@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autorefactor.ai/schemas/feedback_bundle.json",
+  "title": "FeedbackBundle",
+  "type": "object",
+  "required": ["episode_id", "summary", "findings", "source"],
+  "properties": {
+    "episode_id": { "type": "string" },
+    "persona": { "type": "string" },
+    "source": {
+      "type": "string",
+      "enum": ["product_use", "subject_review"]
+    },
+    "lifecycle": {
+      "type": "object",
+      "properties": {
+        "report_reviewed": { "type": "boolean" },
+        "enrich_touched": { "type": "boolean" },
+        "prep_decision": { "type": "string" },
+        "auto_proceed_applied": { "type": "number" },
+        "hitl_sampled": { "type": "number" },
+        "hitl_proceeded": { "type": "number" },
+        "hitl_skipped": { "type": "number" },
+        "hitl_burden_pending": { "type": "number" },
+        "queue_sampled_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "subject_files_edited": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "mcp_tools_used": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "MCP tool names actually invoked during the lifecycle walk"
+        }
+      }
+    },
+    "summary": { "type": "string" },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "severity", "title", "evidence"],
+        "properties": {
+          "id": { "type": "string" },
+          "severity": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "critical"]
+          },
+          "title": { "type": "string" },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "false_positive",
+              "miss",
+              "friction",
+              "logic_flaw",
+              "missing_feature",
+              "bad_confidence",
+              "brief_quality",
+              "other"
+            ]
+          },
+          "product_surface": {
+            "type": "string",
+            "enum": [
+              "report",
+              "queue",
+              "sensor",
+              "mcp",
+              "prep",
+              "confidence",
+              "enrich",
+              "apply",
+              "other"
+            ]
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": { "type": ["string", "null"] },
+                "symbol": { "type": ["string", "null"] },
+                "changeset_id": { "type": ["string", "null"] },
+                "sensor": { "type": ["string", "null"] },
+                "note": { "type": ["string", "null"] }
+              }
+            }
+          },
+          "acceptance": { "type": ["string", "null"] }
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

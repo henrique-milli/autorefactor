@@ -1,4 +1,4 @@
-"""Characterization tests for `beta.util.ScoreAggregator.add` (coderazor ensure-tests)."""
+"""Characterization tests for `beta.util.ScoreAggregator.add` (autorefactor ensure-tests)."""
 
 from __future__ import annotations
 

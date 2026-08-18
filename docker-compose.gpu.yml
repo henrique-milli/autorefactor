@@ -1,0 +1,17 @@
+# GPU override for Ollama only (NVIDIA Container Toolkit required).
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile ollama up -d --build
+#
+# Does not bake CUDA into the autorefactor engine image.
+
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
