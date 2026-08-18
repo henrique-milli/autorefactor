@@ -13,6 +13,8 @@ Write `feedback.json` with `source=product_use` and product-surface evidence (re
 
 If the prompt includes **prior findings** from your last walk on this episode, tag each finding `still_open`, `resolved`, or `new`. Do not re-essay closed items unless new MCP evidence contradicts the claimed fix. Verify product patches listed in the prompt against the current report/queue.
 
+If the prompt includes harness **last retest** counts (`ensure_tests_count`), treat those as measured queue facts. When `ensure_tests_count>=1`, do not mark “zero / missing ensure_tests prep” as `still_open` unless this walk’s `get_report` / `sample_queue` shows count 0. Judge quality of prep and HITL, not existence the probe already measured.
+
 ## Already done
 
 The harness analyzed this episode. Trust `get_status` / `get_report` unless they show the run is not ready — then poll/wait. Do not start a second analyze as ritual.

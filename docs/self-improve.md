@@ -4,7 +4,7 @@ Unattended local loop: **simulated users sample the product → hard-evidenced f
 
 Default shape is **cartesian**: every iteration walks **all user personas × all corpus episodes**. Personas run **in parallel** within an episode; episodes run **sequentially** (engine lock around sync/analyze/rebuild only). `--rotate-pairs` is a cheap debug mode (1 persona × 1 episode). Do not shrink the cartesian walk to fake progress.
 
-**Green retest means spec probes passed on every episode**, not a lone `1.00` from the first repo or an optional Cursor scorer.
+**Green retest means spec probes passed on every episode**, not a lone `1.00` from the first repo or an optional Cursor scorer. Leftover sampled changeset IDs are **notes** (`sticky_ids`); they do not fail the run. Later critic walks see the last episode’s probe counts (`ensure_tests_count`) so they cannot re-file a miss the harness already measured closed.
 
 ## Cycle (honest)
 

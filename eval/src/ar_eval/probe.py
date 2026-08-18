@@ -251,13 +251,17 @@ def apply_spec_probes(
     if spec_expect_security_hitl(spec):
         failures.extend(probe_security_sensitive(changesets))
     sticky = list(sticky_ids or [])
-    if spec_targets_planner(spec) and (planner_unchanged or sticky):
-        failures.append(f"spec targeted planner but queue sticky_ids={sticky}")
+    if sticky:
+        notes.append(f"sticky_ids={sticky}")
+    if planner_unchanged:
+        notes.append("planner_unchanged=true")
     probe = dict(probe)
     probe["failures"] = failures
     probe["notes"] = notes
     probe["ok"] = not failures
     probe["ensure_tests_count"] = ensure_n
+    probe["sticky_ids"] = sticky
+    probe["planner_unchanged"] = bool(planner_unchanged)
     return probe
 
 

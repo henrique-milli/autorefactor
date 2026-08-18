@@ -305,6 +305,7 @@ def _critic_prompt(
     feedback_path: Path | None = None,
     prior_findings: list[dict[str, Any]] | None = None,
     prior_spec: dict[str, Any] | None = None,
+    last_retest: dict[str, Any] | None = None,
 ) -> str:
     out_line = ""
     if feedback_path is not None:
@@ -336,6 +337,18 @@ def _critic_prompt(
             + "; ".join(paths)
             + "\n"
         )
+    if last_retest:
+        n = last_retest.get("ensure_tests_count")
+        memory += (
+            f"Harness last retest for this episode: ensure_tests_count={n} "
+            f"(probe_ok={last_retest.get('ok')}).\n"
+        )
+        if isinstance(n, (int, float)) and float(n) >= 1:
+            memory += (
+                "If ensure_tests_count>=1, do not mark zero/missing ensure_tests prep "
+                "as still_open unless this walk's get_report / sample_queue shows count 0. "
+                "Judge quality of prep/HITL, not existence the probe already measured.\n"
+            )
     return (
         f"{persona}\n\n"
         f"Episode id: `{episode_id}`.\n"
@@ -635,16 +648,49 @@ def _load_feedback_blob(path: Path) -> dict[str, Any] | None:
     return blob if isinstance(blob, dict) else None
 
 
+def _load_last_retest_probe(prev: Path, episode_id: str) -> dict[str, Any] | None:
+    """Previous iteration's per-episode retest probe facts for critic memory."""
+    blob = _load_feedback_blob(prev / episode_id / "retest_probe.json")
+    if isinstance(blob, dict) and (
+        blob.get("ensure_tests_count") is not None
+        or blob.get("failures") is not None
+        or blob.get("ok") is not None
+    ):
+        return {
+            "ensure_tests_count": blob.get("ensure_tests_count"),
+            "ok": blob.get("ok"),
+            "failures": list(blob.get("failures") or []),
+            "notes": list(blob.get("notes") or []),
+        }
+    summary = _load_feedback_blob(prev / "retest_summary.json")
+    episodes = summary.get("episodes") if isinstance(summary, dict) else None
+    if not isinstance(episodes, list):
+        return None
+    for ep in episodes:
+        if not isinstance(ep, dict):
+            continue
+        if str(ep.get("episode_id") or "") != episode_id:
+            continue
+        probe = ep.get("probe") if isinstance(ep.get("probe"), dict) else ep
+        return {
+            "ensure_tests_count": probe.get("ensure_tests_count"),
+            "ok": probe.get("ok") if "ok" in probe else ep.get("passed"),
+            "failures": list(probe.get("failures") or []),
+            "notes": list(probe.get("notes") or []),
+        }
+    return None
+
+
 def _load_prior_critic_memory(
     *,
     loop_root: Path,
     iteration: int,
     episode_id: str,
     persona_files: list[str],
-) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any] | None]:
-    """Prior walk findings per persona stem + last sanitized alpha_spec."""
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any] | None, dict[str, Any] | None]:
+    """Prior walk findings per persona stem, last sanitized alpha_spec, last retest probe."""
     if iteration <= 1:
-        return {}, None
+        return {}, None, None
     prev = loop_root / f"iter-{iteration - 1:03d}"
     spec: dict[str, Any] | None = None
     spec_path = prev / "alpha_spec.sanitized.json"
@@ -662,7 +708,7 @@ def _load_prior_critic_memory(
         findings = blob.get("findings") if blob else None
         if isinstance(findings, list):
             by_persona[stem] = [f for f in findings if isinstance(f, dict)]
-    return by_persona, spec
+    return by_persona, spec, _load_last_retest_probe(prev, episode_id)
 
 
 def _run_one_persona_walk(
@@ -677,17 +723,19 @@ def _run_one_persona_walk(
     progress: LoopProgress | None,
     prior_findings: list[dict[str, Any]] | None = None,
     prior_spec: dict[str, Any] | None = None,
+    last_retest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     stem = _persona_stem(persona_file)
     pdir = art_dir / stem
     pdir.mkdir(parents=True, exist_ok=True)
     fb_path = pdir / "feedback.json"
-    if prior_findings or prior_spec:
+    if prior_findings or prior_spec or last_retest:
         write_json(
             pdir / "prior_feedback.json",
             {
                 "findings": prior_findings or [],
                 "alpha_spec": prior_spec or {},
+                "last_retest": last_retest or {},
             },
         )
     timing: dict[str, Any] = {}
@@ -700,6 +748,7 @@ def _run_one_persona_walk(
                 feedback_path=fb_path,
                 prior_findings=prior_findings,
                 prior_spec=prior_spec,
+                last_retest=last_retest,
             ),
             cwd=workspace,
             model=model,
@@ -742,6 +791,7 @@ def run_stimulus_critic(
     progress: LoopProgress | None = None,
     prior_by_persona: dict[str, list[dict[str, Any]]] | None = None,
     prior_spec: dict[str, Any] | None = None,
+    last_retest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     files = list(persona_files) if persona_files else [persona_file or BASE_USER_PERSONA]
     mode = "copy" if not skip_agents else materialize_mode
@@ -821,6 +871,7 @@ def run_stimulus_critic(
             progress=progress,
             prior_findings=(prior_by_persona or {}).get(stem) or [],
             prior_spec=prior_spec,
+            last_retest=last_retest,
         )
 
     wall: dict[str, Any] = {}
@@ -1100,7 +1151,7 @@ def _run_self_improve_loop_body(
         for ep in selected:
             ep_art = iter_dir / ep.id
             ep_art.mkdir(parents=True, exist_ok=True)
-            prior_by_persona, prior_spec = _load_prior_critic_memory(
+            prior_by_persona, prior_spec, last_retest = _load_prior_critic_memory(
                 loop_root=loop_root,
                 iteration=i,
                 episode_id=ep.id,
@@ -1122,6 +1173,7 @@ def _run_self_improve_loop_body(
                 progress=progress,
                 prior_by_persona=prior_by_persona,
                 prior_spec=prior_spec,
+                last_retest=last_retest,
             )
             stim_results.append(stim)
             for walk in stim.get("walks") or []:

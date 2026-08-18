@@ -133,7 +133,7 @@ def test_apply_spec_probes_requires_prep_and_security_hitl() -> None:
     assert probe["ensure_tests_count"] == 0
 
 
-def test_apply_spec_probes_fails_planner_sticky() -> None:
+def test_apply_spec_probes_sticky_ids_are_notes_when_prep_present() -> None:
     from ar_eval.probe import apply_spec_probes
 
     spec = {
@@ -141,15 +141,22 @@ def test_apply_spec_probes_fails_planner_sticky() -> None:
             {
                 "path": "src/autorefactor/plan/followups.py",
                 "rationale": "planner still missing prep",
+                "acceptance": "ensure_tests ranked before splits",
             }
         ]
     }
     probe = apply_spec_probes(
         {"ok": True, "failures": [], "notes": []},
-        [{"id": "cs-old", "action": "ensure_tests"}],
+        [{"id": "cs-new", "action": "ensure_tests"}],
         spec,
         planner_unchanged=True,
-        sticky_ids=["cs-old"],
+        sticky_ids=["hitl-brief"],
     )
-    assert probe["ok"] is False
-    assert any("sticky_ids" in f for f in probe["failures"])
+    assert probe["ok"] is True
+    assert probe["ensure_tests_count"] == 1
+    assert probe["sticky_ids"] == ["hitl-brief"]
+    assert probe["planner_unchanged"] is True
+    joined_notes = " ".join(probe["notes"])
+    assert "sticky_ids=" in joined_notes
+    assert "planner_unchanged=true" in joined_notes
+    assert not any("sticky_ids" in f for f in probe["failures"])

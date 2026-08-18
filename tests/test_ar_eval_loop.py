@@ -1079,6 +1079,7 @@ def test_critic_prompt_is_goal_oriented(tmp_path: Path) -> None:
         prior_spec={
             "changes": [{"path": "src/autorefactor/plan/followups.py", "acceptance": "prep"}]
         },
+        last_retest={"ensure_tests_count": 46, "ok": True, "failures": [], "notes": []},
     )
     lower = text.lower()
     assert "mission" in lower
@@ -1091,8 +1092,50 @@ def test_critic_prompt_is_goal_oriented(tmp_path: Path) -> None:
     assert "still_open" in lower
     assert "ensure_tests miss" in text
     assert "followups.py" in text
+    assert "ensure_tests_count=46" in text
+    assert "do not mark zero/missing ensure_tests prep" in lower
     for ban in ("`mvn", "`pytest", "`npm", "mvn test", "npm test"):
         assert ban not in lower
+
+
+def test_load_prior_critic_memory_reads_retest_probe(tmp_path: Path) -> None:
+    from ar_eval.loop import _load_prior_critic_memory
+
+    loop_root = tmp_path / "loop"
+    prev = loop_root / "iter-001" / "ep1"
+    prev.mkdir(parents=True)
+    (loop_root / "iter-001" / "alpha_spec.sanitized.json").write_text(
+        json.dumps({"changes": [{"path": "src/autorefactor/plan/followups.py"}]}),
+        encoding="utf-8",
+    )
+    stem_dir = prev / "product_critic"
+    stem_dir.mkdir()
+    (stem_dir / "feedback.json").write_text(
+        json.dumps({"findings": [{"id": "f1", "title": "prep miss"}]}),
+        encoding="utf-8",
+    )
+    (prev / "retest_probe.json").write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "ensure_tests_count": 46,
+                "failures": [],
+                "notes": ["ensure_tests_count=46"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    by_persona, spec, last_retest = _load_prior_critic_memory(
+        loop_root=loop_root,
+        iteration=2,
+        episode_id="ep1",
+        persona_files=["user_product_critic.md"],
+    )
+    assert by_persona["product_critic"][0]["title"] == "prep miss"
+    assert spec and spec["changes"]
+    assert last_retest is not None
+    assert last_retest["ensure_tests_count"] == 46
+    assert last_retest["ok"] is True
 
 
 def test_personas_are_goal_oriented() -> None:
