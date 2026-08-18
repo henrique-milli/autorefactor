@@ -31,6 +31,9 @@ _MAPPING_ANNOTATION = re.compile(r"@Mapping\b")
 _WIRING_HANDLER_FROM_TITLE = re.compile(r"handler `(\w+)\.(\w+)`", re.IGNORECASE)
 _WIRING_HANDLER_FROM_EVIDENCE = re.compile(r"`(\w+)\.(\w+)`")
 _DEFAULT_AUTORUN_THRESHOLD = 0.6
+_AUTORUN_BLOCKED_KINDS = frozenset(
+    {"committed_secret", "disabled_startup_validation", "draft_in_memory_map"}
+)
 
 
 def _wiring_handler_names(changeset: Changeset) -> tuple[str | None, str | None]:
@@ -121,13 +124,24 @@ def behavior_sensitive_dedup(changeset: Changeset) -> bool:
 
 
 def placement_risk_move(changeset: Changeset) -> bool:
-    """Move into data/DTO types that inject persistence/repository dependencies."""
+    """Move into data/DTO types or public service methods needs HITL."""
     if (changeset.action or "").strip().lower() != "move":
         return False
     blob = _changeset_text_blob(changeset)
-    if not _PERSISTENCE_DEP.search(blob):
-        return False
-    return bool(_DATA_DTO_TARGET.search(blob))
+    if _PERSISTENCE_DEP.search(blob) and _DATA_DTO_TARGET.search(blob):
+        return True
+    blob_l = blob.lower()
+    if any(tok in blob_l for tok in ("serviceimpl", "/service/", " public service")):
+        return True
+    for target in changeset.targets or []:
+        sym = (target.symbol or "").lower()
+        path = (target.path or "").replace("\\", "/").lower()
+        simple = sym.rsplit(".", 1)[-1]
+        if simple.endswith("service") or "serviceimpl" in simple:
+            return True
+        if "/service/" in path:
+            return True
+    return False
 
 
 def _low_confidence_hitl(changeset: Changeset, min_confidence: float) -> bool:
@@ -164,6 +178,85 @@ def security_sensitive_hitl(changeset: Changeset) -> bool:
         return True
     if "mongodb+srv://" in blob or ("password=" in blob and "mongodb" in blob):
         return True
+    return False
+
+
+def slop_kind_hitl(changeset: Changeset) -> bool:
+    """Behavioral/slop kinds must never auto_proceed on numeric confidence alone."""
+    kind = str((changeset.metrics_delta or {}).get("kind") or "").lower()
+    if kind in _AUTORUN_BLOCKED_KINDS - {"committed_secret"}:
+        return True
+    blob = _changeset_text_blob(changeset).lower()
+    return any(token in blob for token in ("disabled_startup_validation", "draft_in_memory_map"))
+
+
+def _target_identity_key(target) -> tuple[str, str, str]:  # noqa: ANN001
+    return (
+        target.repo or "",
+        (target.path or "").replace("\\", "/").lstrip("./"),
+        target.symbol or "",
+    )
+
+
+def is_self_merge_changeset(changeset: Changeset) -> bool:
+    """True when merge/delete_duplicate targets collapse to one repo+path+symbol."""
+    action = (changeset.action or "").strip().lower()
+    if action not in _HITL_AT_THRESHOLD_ACTIONS:
+        return False
+    if len(changeset.targets or []) < 2:
+        return False
+    keys = {_target_identity_key(t) for t in changeset.targets}
+    return len(keys) <= 1
+
+
+def self_merge_hitl(changeset: Changeset) -> bool:
+    """Overload self-merge pairs must never auto_proceed."""
+    return is_self_merge_changeset(changeset)
+
+
+def _ensure_tests_dep_ids(changeset: Changeset, queue: list[Changeset]) -> set[str]:
+    by_id = {c.id: c for c in queue}
+    out: set[str] = set()
+    for dep_id in changeset.depends_on or []:
+        dep = by_id.get(dep_id)
+        if dep and (dep.action or "").strip().lower() == "ensure_tests":
+            out.add(dep_id)
+    return out
+
+
+def uncovered_structural_hitl(
+    changeset: Changeset,
+    queue: list[Changeset] | None = None,
+) -> bool:
+    """Structural primaries on uncovered production units need HITL without ensure_tests prep."""
+    if (changeset.metrics_delta or {}).get("followup"):
+        return False
+    action = (changeset.action or "").strip().lower()
+    if action not in {"split", "extract_shared", "move"}:
+        return False
+    metrics = changeset.metrics_delta or {}
+    if not metrics.get("needs_coverage"):
+        return False
+    if queue and _ensure_tests_dep_ids(changeset, queue):
+        return False
+    return True
+
+
+def blast_radius_hitl(changeset: Changeset) -> bool:
+    """Multi-target extract_shared or cross-class delete_duplicate needs HITL."""
+    action = (changeset.action or "").strip().lower()
+    targets = changeset.targets or []
+    if action == "extract_shared" and len(targets) >= 6:
+        return True
+    if action == "delete_duplicate" and len(targets) >= 2:
+        classes = {
+            (t.symbol or "").rsplit(".", 1)[0]
+            for t in targets
+            if (t.symbol or "").strip()
+        }
+        classes.discard("")
+        if len(classes) >= 2:
+            return True
     return False
 
 
@@ -251,6 +344,14 @@ def changeset_needs_hitl(
         return True, "blocked_deps"
     if security_sensitive_hitl(changeset):
         return True, "security_sensitive"
+    if slop_kind_hitl(changeset):
+        return True, "slop_sensitive"
+    if self_merge_hitl(changeset):
+        return True, "self_merge"
+    if blast_radius_hitl(changeset):
+        return True, "blast_radius"
+    if queue and uncovered_structural_hitl(changeset, queue):
+        return True, "uncovered_structural"
     if architectural_wiring_hitl(changeset):
         return True, "architectural_wiring"
     if ensure_tests_padding_hitl(changeset):
@@ -297,6 +398,35 @@ def hitl_questions_for_reason(
             "Security-sensitive finding (committed secret/credential) — never auto_proceed.",
             f"Proceed with '{changeset.title}' ({changeset.action}) only after confirming "
             "secret rotation and externalization via env/vault.",
+            "Reply yes to continue, skip to skip, or blocked.",
+        ]
+    if reason == "slop_sensitive":
+        return [
+            "Behavioral/slop finding (disabled validation, draft in-memory map, etc.) — "
+            "never auto_proceed on numeric confidence alone.",
+            f"Proceed with '{changeset.title}' ({changeset.action}) only after confirming "
+            "the fix matches the rationale (enable/remove/replace, not a blind split).",
+            "Reply yes to continue, skip to skip, or blocked.",
+        ]
+    if reason == "self_merge":
+        return [
+            "Self-merge: merge/delete_duplicate targets share the same repo+path+symbol — "
+            "likely an overload false positive.",
+            f"Proceed with '{changeset.title}' ({changeset.action})?",
+            "Reply yes to continue, skip to skip, or blocked.",
+        ]
+    if reason == "blast_radius":
+        return [
+            "High blast-radius structural change (multi-target extract_shared or "
+            "cross-class delete_duplicate) — confirm before applying.",
+            f"Proceed with '{changeset.title}' ({changeset.action})?",
+            "Reply yes to continue, skip to skip, or blocked.",
+        ]
+    if reason == "uncovered_structural":
+        return [
+            "Structural change on production units without Jacoco coverage prep — "
+            "confirm or run ensure_tests first.",
+            f"Proceed with '{changeset.title}' ({changeset.action})?",
             "Reply yes to continue, skip to skip, or blocked.",
         ]
     if reason == "architectural_wiring":

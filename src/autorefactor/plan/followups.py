@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from autorefactor.changesets.models import Changeset, ChangesetTarget
+from autorefactor.changesets.models import Changeset, ChangesetStatus, ChangesetTarget
 from autorefactor.changesets.ranking import coverage_first_mode, prep_rank
 from autorefactor.domain import (
     CodeUnit,
@@ -23,7 +23,9 @@ from autorefactor.testing.gaps import (
 )
 from autorefactor.testing.inventory import inventory_test_files
 
-FOLLOWUP_CONFIDENCE = 0.55
+_FOLLOWUP_CONFIDENCE = 0.55
+FOLLOWUP_CONFIDENCE = _FOLLOWUP_CONFIDENCE
+_SLOP_PARENT_KINDS = frozenset({"disabled_startup_validation", "draft_in_memory_map"})
 _HANDLER_REGULATOR = re.compile(r"(Handler|Mapper|Regulator|Service)", re.IGNORECASE)
 _ARCHITECTURAL_WIRING_KINDS = frozenset({"orphan_kafka", "test_only_handler"})
 _WIRING_HANDLER_FROM_TITLE = re.compile(r"handler `(\w+)\.(\w+)`", re.IGNORECASE)
@@ -996,7 +998,12 @@ def _batch_document_followup(group: list[Changeset]) -> Changeset:
 
 def _consolidate_document_followups(changesets: list[Changeset]) -> list[Changeset]:
     """Skip orphaned doc follow-ups; batch overlapping siblings into one opt-in prep item."""
-    primary_ids = {cs.id for cs in changesets if not (cs.metrics_delta or {}).get("followup")}
+    primary_by_id = {
+        cs.id: cs
+        for cs in changesets
+        if not (cs.metrics_delta or {}).get("followup")
+    }
+    primary_ids = set(primary_by_id)
     folded = _folded_parent_ids(changesets)
     primaries: list[Changeset] = []
     doc_followups: list[Changeset] = []
@@ -1013,10 +1020,20 @@ def _consolidate_document_followups(changesets: list[Changeset]) -> list[Changes
         parent = str((cs.metrics_delta or {}).get("parent_changeset_id") or "")
         if parent and (parent not in primary_ids or parent in folded):
             continue
+        parent_cs = primary_by_id.get(parent)
+        if parent_cs is not None:
+            parent_action = (parent_cs.action or "").strip().lower()
+            if parent_action in {"merge", "delete_duplicate"}:
+                continue
+            if parent_cs.status == ChangesetStatus.SKIPPED:
+                continue
         doc_followups.append(cs)
 
     if len(doc_followups) <= 1:
         return primaries + other + doc_followups
+
+    if len(doc_followups) >= 3:
+        return primaries + other + [_batch_document_followup(doc_followups)]
 
     remaining = list(doc_followups)
     batched: list[Changeset] = []
@@ -1169,21 +1186,33 @@ def attach_quality_followups(
         ensure_units = wiring_units or cov_units
 
         metrics = dict(cs.metrics_delta or {})
+        coverage_low = (
+            coverage is not None
+            and coverage.overall_percent is not None
+            and float(coverage.overall_percent) < 50
+        )
         if doc_units:
             metrics["needs_write_docs"] = True
             metrics["doc_gap_count"] = len(doc_units)
         if ensure_units:
             metrics["needs_coverage"] = True
             metrics["coverage_gap_count"] = len(ensure_units)
+        elif (cs.action or "").strip().lower() in {"split", "extract_shared", "move"}:
+            if index_empty:
+                metrics["coverage_index_empty"] = True
+            if index_empty or coverage_low:
+                metrics["needs_coverage"] = True
 
         depends = list(cs.depends_on or [])
         ensure_cs: Changeset | None = None
 
+        parent_kind = str((cs.metrics_delta or {}).get("kind") or "")
         # Don't duplicate if this CS is already document/ensure_tests
         skip_doc_followup = (
             coverage_first_mode(out + followups)
             or bool(primary_ensure_unit_ids)
             or bool(ensure_units and cs.action not in {"ensure_tests"})
+            or parent_kind in _SLOP_PARENT_KINDS
         )
         if doc_units and cs.action not in {"document"} and not skip_doc_followup:
             followups.append(

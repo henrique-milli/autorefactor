@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from autorefactor.changesets.models import Changeset
 from autorefactor.freshness import freshness_payload, workspace_content_fingerprint
 from autorefactor.paths import write_run_identity
 
@@ -184,3 +187,171 @@ def test_apply_safe_allows_queue_when_harness_snapshot_drifts(tmp_path: Path) ->
     (ws / ".ar_eval_snapshot.json").write_text("{}", encoding="utf-8")
     blocked = _queue_freshness_gate(workspace=ws, out_dir=out, active_job=None)
     assert blocked is None
+
+
+def test_stale_fingerprint_invalidates_done_skipped_and_surfaces_cta(tmp_path: Path) -> None:
+    from autorefactor.changesets.models import ChangesetStatus
+    from autorefactor.queue import load_queue, save_queue
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "main.py").write_text("print(1)\n", encoding="utf-8")
+    out = tmp_path / "run"
+    out.mkdir()
+    write_run_identity(out, ws)
+    (out / "report").mkdir()
+    (out / "report" / "metrics.json").write_text("{}", encoding="utf-8")
+    save_queue(
+        out,
+        [
+            Changeset(
+                id="done1",
+                title="Done split",
+                action="split",
+                brief="b",
+                rationale="r",
+                confidence=0.9,
+                targets=[],
+                status=ChangesetStatus.DONE,
+            ),
+            Changeset(
+                id="skip1",
+                title="Skipped doc",
+                action="document",
+                brief="b",
+                rationale="r",
+                confidence=0.55,
+                targets=[],
+                status=ChangesetStatus.SKIPPED,
+            ),
+        ],
+    )
+    (ws / "main.py").write_text("print(2)\n", encoding="utf-8")
+
+    stale = freshness_payload(workspace=ws, out_dir=out)
+    assert stale["fresh"] is False
+    assert stale["apply_safe"] is False
+    assert stale["metrics_review_ok"] is True
+    assert stale.get("re_analyze_cta")
+    assert "Re-analyze" in stale["re_analyze_cta"]
+    assert stale.get("stale_queue_invalidated") == 2
+
+    items = load_queue(out)
+    assert all(c.status == ChangesetStatus.PENDING for c in items)
+    assert all((c.metrics_delta or {}).get("fingerprint_stale") for c in items)
+
+
+def test_get_status_by_status_matches_post_invalidation_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autorefactor.changesets.models import ChangesetStatus
+    from autorefactor.mcp import tools as T
+    from autorefactor.mcp.tools import tool_get_status
+    from autorefactor.paths import write_run_identity
+    from autorefactor.queue import save_queue
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "main.py").write_text("print(1)\n", encoding="utf-8")
+    out = tmp_path / "run"
+    out.mkdir()
+    write_run_identity(out, ws)
+    (out / "report").mkdir()
+    (out / "report" / "metrics.json").write_text("{}", encoding="utf-8")
+    save_queue(
+        out,
+        [
+            Changeset(
+                id="done1",
+                title="Done split",
+                action="split",
+                brief="b",
+                rationale="r",
+                confidence=0.9,
+                targets=[],
+                status=ChangesetStatus.DONE,
+            ),
+            Changeset(
+                id="skip1",
+                title="Skipped doc",
+                action="document",
+                brief="b",
+                rationale="r",
+                confidence=0.55,
+                targets=[],
+                status=ChangesetStatus.SKIPPED,
+            ),
+        ],
+    )
+    (ws / "main.py").write_text("print(2)\n", encoding="utf-8")
+
+    monkeypatch.setattr(T, "_maybe_proxy", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        T,
+        "resolve_workspace_info",
+        lambda _w=None: {"workspace": str(ws), "path": ws, "resolved_via": "test"},
+    )
+    monkeypatch.setattr(T, "resolve_out_dir", lambda _ws, _o=None: out)
+    monkeypatch.setattr(
+        T,
+        "load_merged_config",
+        lambda **_k: type(
+            "Cfg",
+            (),
+            {
+                "confidence_threshold": 0.6,
+                "runtime_summary": lambda self: {"chat_backend": "x", "embed_backend": "y", "parallel_llm": False},
+                "resolved_describe_mode": lambda self: "raw",
+                "resolved_focus": lambda self: None,
+            },
+        )(),
+    )
+    monkeypatch.setattr(T, "needs_setup", lambda _c: False)
+    monkeypatch.setattr(T, "setup_hint", lambda _c: None)
+    monkeypatch.setattr(
+        "autorefactor.enrich_queue.pending_enrich_count", lambda _o: 0
+    )
+
+    status = tool_get_status(workspace=str(ws), out=str(out))
+    assert status["fresh"] is False
+    assert status["stale_queue_invalidated"] == 2
+    assert status["fingerprint_stale"] == 2
+    assert status["by_status"] == {"pending": 2}
+    assert status["queue_counts"]["pending"] == 2
+    assert status["queue_counts"]["done"] == 0
+
+
+def test_apply_safe_false_when_stale_even_with_pending(tmp_path: Path) -> None:
+    from autorefactor.changesets.models import ChangesetStatus
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "main.py").write_text("print(1)\n", encoding="utf-8")
+    out = tmp_path / "run"
+    out.mkdir()
+    write_run_identity(out, ws)
+    queue = out / "queue" / "changesets.json"
+    queue.parent.mkdir(parents=True, exist_ok=True)
+    queue.write_text(
+        json.dumps(
+            {
+                "changesets": [
+                    {
+                        "id": "cs1",
+                        "title": "Split",
+                        "action": "split",
+                        "brief": "b",
+                        "rationale": "r",
+                        "confidence": 0.9,
+                        "targets": [],
+                        "status": ChangesetStatus.PENDING.value,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ws / "main.py").write_text("print(2)\n", encoding="utf-8")
+    stale = freshness_payload(workspace=ws, out_dir=out)
+    assert stale["fresh"] is False
+    assert stale["apply_safe"] is False

@@ -969,3 +969,207 @@ def test_wiring_orphan_kafka_emits_integration_ensure_tests() -> None:
     assert any("processPokerstarsTransaction" in (s or "") for s in symbols)
     assert not any("JanusBonusApplication.main" in (s or "") for s in symbols)
 
+
+def test_slop_kinds_and_public_service_move_require_hitl() -> None:
+    from autorefactor.changesets.store import changeset_needs_hitl
+
+    secret = Changeset(
+        id="ff32204199ac5273",
+        title="Document committed credential in application.yaml",
+        action="document",
+        brief="mongodb+srv:// user:pass@cluster",
+        rationale="committed_secret",
+        confidence=0.92,
+        targets=[
+            ChangesetTarget(
+                repo="janus-account",
+                path="src/main/resources/application.yaml",
+                symbol="application.yaml",
+            )
+        ],
+        metrics_delta={"kind": "committed_secret"},
+    )
+    disabled = Changeset(
+        id="fe97625b3320349a",
+        title="Split ConfigurationValidator",
+        action="split",
+        brief="re-enable startup validation",
+        rationale="disabled @PostConstruct TODO",
+        confidence=0.79,
+        targets=[
+            ChangesetTarget(
+                repo="janus-bonus",
+                path="src/main/java/com/example/ConfigurationValidator.java",
+                symbol="com.example.ConfigurationValidator",
+            )
+        ],
+        metrics_delta={"kind": "disabled_startup_validation"},
+    )
+    draft = Changeset(
+        id="4096a98dfe44ed21",
+        title="Extract shared draft map",
+        action="extract_shared",
+        brief="draft in-memory mapping",
+        rationale="replace HashMap defaults with Mongo config",
+        confidence=0.76,
+        targets=[
+            ChangesetTarget(
+                repo="janus-bonus",
+                path="src/main/java/com/example/PokerstarsProductMappingService.java",
+                symbol="com.example.PokerstarsProductMappingService",
+            )
+        ],
+        metrics_delta={"kind": "draft_in_memory_map"},
+    )
+    move = Changeset(
+        id="b56aa95fc418cf8b",
+        title="Move aggregateBonuses to AggregatedBonusData",
+        action="move",
+        brief="cosine=0.967 placement into BonusAggregationService",
+        rationale="relocate public service method",
+        confidence=0.97,
+        targets=[
+            ChangesetTarget(
+                repo="janus-bonus",
+                path="src/main/java/com/example/BonusAggregationService.java",
+                symbol="com.example.BonusAggregationService.aggregateBonuses",
+            )
+        ],
+    )
+
+    for cs, reason in (
+        (secret, "security_sensitive"),
+        (disabled, "slop_sensitive"),
+        (draft, "slop_sensitive"),
+        (move, "placement_risk"),
+    ):
+        needs, hitl_reason = changeset_needs_hitl(cs, 0.6)
+        assert needs is True
+        assert hitl_reason == reason
+
+
+def test_batched_document_followups_collapse_many_siblings() -> None:
+    from autorefactor.plan.followups import _consolidate_document_followups
+
+    split = Changeset(
+        id="split1",
+        title="Split PersistenceService",
+        action="split",
+        brief="b",
+        rationale="r",
+        confidence=0.99,
+        targets=[
+            ChangesetTarget(
+                repo="janus-account",
+                path="src/main/java/PersistenceService.java",
+                unit_id="u1",
+                symbol="PersistenceService",
+            )
+        ],
+    )
+    docs = [
+        Changeset(
+            id=f"doc{i}",
+            title=f"Document gaps for: item {i}",
+            action="document",
+            brief="b",
+            rationale="missing docs",
+            confidence=0.55,
+            targets=[
+                ChangesetTarget(
+                    repo="janus-account",
+                    path=f"src/main/java/File{i}.java",
+                    unit_id=f"u{i}",
+                    symbol=f"File{i}",
+                )
+            ],
+            metrics_delta={"followup": True, "parent_changeset_id": "split1"},
+        )
+        for i in range(5)
+    ]
+    out = _consolidate_document_followups([split, *docs])
+    doc_items = [c for c in out if c.action == "document"]
+    assert len(doc_items) == 1
+    assert doc_items[0].metrics_delta.get("batched_document_prep") is True
+
+
+def test_self_merge_and_uncovered_structural_require_hitl() -> None:
+    from autorefactor.changesets.store import changeset_needs_hitl
+
+    self_merge = Changeset(
+        id="a1d90ed41bcba051",
+        title="Merge duplicate fill overloads",
+        action="merge",
+        brief="identical qualified symbol on both targets",
+        rationale="dedup",
+        confidence=0.99,
+        targets=[
+            ChangesetTarget(
+                repo="janus-account",
+                path="src/main/java/A.java",
+                symbol="com.example.A.fill",
+            ),
+            ChangesetTarget(
+                repo="janus-account",
+                path="src/main/java/A.java",
+                symbol="com.example.A.fill",
+            ),
+        ],
+    )
+    needs, reason = changeset_needs_hitl(self_merge, 0.6)
+    assert needs is True
+    assert reason == "self_merge"
+
+    split = Changeset(
+        id="159071f08b598f0c",
+        title="Split processPokerstarsTransaction",
+        action="split",
+        brief="b",
+        rationale="r",
+        confidence=0.99,
+        targets=[
+            ChangesetTarget(
+                repo="janus-bonus",
+                path="src/main/java/Handler.java",
+                symbol="com.example.Handler.processPokerstarsTransaction",
+            )
+        ],
+        metrics_delta={"needs_coverage": True, "coverage_index_empty": True},
+    )
+    needs, reason = changeset_needs_hitl(split, 0.6, queue=[split])
+    assert needs is True
+    assert reason == "uncovered_structural"
+
+    ensure = Changeset(
+        id="prep1",
+        title="Ensure tests",
+        action="ensure_tests",
+        brief="b",
+        rationale="r",
+        confidence=0.55,
+        targets=[],
+        metrics_delta={"followup": True},
+    )
+    split_with_prep = split.model_copy(update={"depends_on": ["prep1"]})
+    needs, reason = changeset_needs_hitl(
+        split_with_prep, 0.6, deps_satisfied=False, queue=[split_with_prep, ensure]
+    )
+    assert needs is True
+    assert reason == "blocked_deps"
+
+    extract = Changeset(
+        id="e4a2f1d26177efee",
+        title="Extract shared across endpoints",
+        action="extract_shared",
+        brief="b",
+        rationale="r",
+        confidence=0.99,
+        targets=[
+            ChangesetTarget(repo="janus-account", path="a.java", symbol=f"com.example.S.m{i}")
+            for i in range(6)
+        ],
+    )
+    needs, reason = changeset_needs_hitl(extract, 0.6)
+    assert needs is True
+    assert reason == "blast_radius"
+

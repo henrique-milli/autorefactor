@@ -186,6 +186,127 @@ def _queue_has_pending_apply(out_dir: Path) -> bool:
     )
 
 
+def _queue_terminal_counts(out_dir: Path) -> tuple[int, int]:
+    from autorefactor.changesets.models import ChangesetStatus
+    from autorefactor.queue import load_queue
+
+    items = load_queue(out_dir)
+    done = skipped = 0
+    for c in items:
+        if c.status == ChangesetStatus.DONE:
+            done += 1
+        elif c.status == ChangesetStatus.SKIPPED:
+            skipped += 1
+    return done, skipped
+
+
+def _skip_orphan_doc_followups(items: list[Any]) -> tuple[list[Any], int]:
+    """Auto-skip document follow-ups whose structural parent was skipped."""
+    from autorefactor.changesets.models import Changeset, ChangesetStatus
+
+    by_id = {c.id: c for c in items if isinstance(c, Changeset)}
+    cascaded = 0
+    out: list[Any] = []
+    for c in items:
+        if not isinstance(c, Changeset):
+            out.append(c)
+            continue
+        metrics = c.metrics_delta or {}
+        if (
+            metrics.get("followup")
+            and (c.action or "").strip().lower() == "document"
+            and c.status == ChangesetStatus.PENDING
+        ):
+            parent_id = str(metrics.get("parent_changeset_id") or "")
+            parent = by_id.get(parent_id)
+            if parent is not None and parent.status == ChangesetStatus.SKIPPED:
+                note = "parent_skipped"
+                out.append(
+                    c.model_copy(
+                        update={
+                            "status": ChangesetStatus.SKIPPED,
+                            "notes": f"{c.notes}; {note}" if c.notes else note,
+                        }
+                    )
+                )
+                cascaded += 1
+                continue
+        out.append(c)
+    return out, cascaded
+
+
+def invalidate_queue_on_fingerprint_drift(out_dir: Path) -> dict[str, Any]:
+    """Reset done/skipped queue entries when workspace fingerprint drifted."""
+    from autorefactor.changesets.models import ChangesetStatus
+    from autorefactor.queue import load_queue, save_queue
+
+    out_path = Path(out_dir)
+    items = load_queue(out_path)
+    invalidated = 0
+    updated: list[Any] = []
+    for c in items:
+        if c.status in {ChangesetStatus.DONE, ChangesetStatus.SKIPPED} and not (
+            c.metrics_delta or {}
+        ).get("fingerprint_stale"):
+            metrics = dict(c.metrics_delta or {})
+            metrics["fingerprint_stale"] = True
+            metrics["prior_status"] = c.status.value
+            note = "fingerprint_stale:re-analyze required"
+            updated.append(
+                c.model_copy(
+                    update={
+                        "status": ChangesetStatus.PENDING,
+                        "notes": f"{c.notes}; {note}" if c.notes else note,
+                        "metrics_delta": metrics,
+                    }
+                )
+            )
+            invalidated += 1
+        else:
+            updated.append(c)
+    if invalidated:
+        updated, cascaded = _skip_orphan_doc_followups(updated)
+        save_queue(out_path, updated)
+        return {"invalidated": invalidated, "orphan_docs_skipped": cascaded}
+    updated, cascaded = _skip_orphan_doc_followups(updated)
+    if cascaded:
+        save_queue(out_path, updated)
+        return {"invalidated": 0, "orphan_docs_skipped": cascaded}
+    return {"invalidated": 0, "orphan_docs_skipped": 0}
+
+
+def re_analyze_cta(
+    *,
+    reason: str,
+    metrics_review_ok: bool,
+    queue_drained: bool,
+) -> str:
+    """Prominent CTA distinguishing read-only review from apply-blocked state."""
+    if reason == "content_changed":
+        if metrics_review_ok and queue_drained:
+            return (
+                "**Re-analyze required** — workspace changed since last analyze. "
+                "Report metrics are OK for read-only review; queue apply is blocked. "
+                "Call analyze(background=true) to refresh before applying."
+            )
+        if metrics_review_ok:
+            return (
+                "**Re-analyze recommended** — workspace changed since last analyze. "
+                "Report metrics are OK for review; pending queue items may be stale. "
+                "Call analyze(background=true) before applying refactors."
+            )
+        return (
+            "**Re-analyze required** — workspace changed since last analyze. "
+            "Call analyze(background=true) before using the queue or report."
+        )
+    if reason == "missing_fingerprint":
+        return (
+            "**Re-analyze required** — run has no workspace fingerprint. "
+            "Call analyze(background=true) before applying queue items."
+        )
+    return "**Re-analyze required** — run is stale. Call analyze(background=true)."
+
+
 def workspace_git_meta(workspace: Path) -> dict[str, Any]:
     """Best-effort git HEAD + dirty flag; never required for freshness."""
     root = Path(workspace).expanduser().resolve()
@@ -273,16 +394,33 @@ def freshness_payload(
         }
     ok = str(run_fp) == current
     reason = "ok" if ok else "content_changed"
-    apply_safe = bool(not ok and reason == "content_changed" and _queue_has_pending_apply(out_path))
+    stale_queue: dict[str, Any] = {"invalidated": 0, "orphan_docs_skipped": 0}
+    if not ok and reason == "content_changed":
+        stale_queue = invalidate_queue_on_fingerprint_drift(out_path)
+    metrics_review_ok = bool(
+        not ok and _run_has_analyze_artifacts(out_path) and reason in {"content_changed", "missing_fingerprint"}
+    )
+    queue_drained = not _queue_has_pending_apply(out_path)
+    apply_safe = ok
+    cta = None if ok else re_analyze_cta(
+        reason=reason,
+        metrics_review_ok=metrics_review_ok,
+        queue_drained=queue_drained,
+    )
     return {
         "fresh": ok,
         "apply_safe": apply_safe,
+        "metrics_review_ok": metrics_review_ok,
+        "re_analyze_cta": cta,
+        "stale_queue_invalidated": int(stale_queue.get("invalidated") or 0),
         "freshness": {
             "run_fingerprint": run_fp,
             "current_fingerprint": current,
             "reason": reason,
             "git": git,
             "apply_safe": apply_safe,
+            "metrics_review_ok": metrics_review_ok,
+            "stale_queue_invalidated": int(stale_queue.get("invalidated") or 0),
         },
     }
 

@@ -369,6 +369,31 @@ def tool_get_progress(
     return _local_get_progress(job_id=job_id, workspace=workspace, out=out)
 
 
+def _queue_fingerprint_stale_count(items: list) -> int:  # noqa: ANN001
+    return sum(1 for c in items if (c.metrics_delta or {}).get("fingerprint_stale"))
+
+
+def _status_counts(items: list) -> dict[str, int]:  # noqa: ANN001
+    by_status: dict[str, int] = {}
+    for item in items:
+        key = item.status.value
+        by_status[key] = by_status.get(key, 0) + 1
+    return by_status
+
+
+def _freshness_queue_snapshot(
+    ws: Path,
+    out_dir: Path,
+) -> tuple[dict[str, Any], list, dict[str, int], int]:
+    """Run freshness (may invalidate queue), then load a single post-invalidation snapshot."""
+    from autorefactor.freshness import freshness_payload
+    from autorefactor.queue import load_queue
+
+    fresh = freshness_payload(workspace=ws, out_dir=out_dir if out_dir.is_dir() else None)
+    items = load_queue(out_dir)
+    return fresh, items, _status_counts(items), _queue_fingerprint_stale_count(items)
+
+
 def _queue_freshness_gate(
     *,
     workspace: Path,
@@ -429,7 +454,6 @@ def tool_get_status(workspace: str | None = None, out: str | None = None) -> dic
     if proxied is not None:
         return proxied
     from autorefactor.jobs import active_job_id, job_status
-    from autorefactor.queue import load_queue
 
     info, err = _require_workspace(workspace)
     if err is not None:
@@ -438,11 +462,7 @@ def tool_get_status(workspace: str | None = None, out: str | None = None) -> dic
     ws = info["path"]
     out_dir = resolve_out_dir(ws, Path(out) if out else None)
     config = load_merged_config(workspace=ws, out_dir=out_dir)
-    items = load_queue(out_dir)
-    by_status: dict[str, int] = {}
-    for item in items:
-        key = item.status.value
-        by_status[key] = by_status.get(key, 0) + 1
+    fresh, items, by_status, fingerprint_stale = _freshness_queue_snapshot(ws, out_dir)
     report_md = out_dir / "report" / "report.md"
     lock_key = str(out_dir.resolve())
     active = active_job_id(lock_key)
@@ -490,11 +510,15 @@ def tool_get_status(workspace: str | None = None, out: str | None = None) -> dic
     }
     if active:
         payload["active_job"] = job_status(active)
-    from autorefactor.freshness import freshness_payload
-
-    fresh = freshness_payload(workspace=ws, out_dir=out_dir if out_dir.is_dir() else None)
     payload.update(fresh)
+    payload["fingerprint_stale"] = fingerprint_stale
     reason = str((fresh.get("freshness") or {}).get("reason") or "")
+    if not fresh.get("fresh"):
+        cta = fresh.get("re_analyze_cta")
+        if cta:
+            payload["stale_warning"] = cta
+            if not payload.get("active_job"):
+                payload.setdefault("next_step", cta)
     if not fresh.get("fresh") and reason == "missing_fingerprint" and not payload.get("active_job"):
         payload["ok"] = False
         payload["queue_blocked"] = True
@@ -504,7 +528,7 @@ def tool_get_status(workspace: str | None = None, out: str | None = None) -> dic
         )
     threshold = float(config.confidence_threshold)
     payload["confidence_threshold"] = threshold
-    counts = _queue_counts(out_dir, threshold=threshold)
+    counts = _queue_counts(out_dir, threshold=threshold, items=items)
     payload["queue_counts"] = counts
     payload["hitl_burden"] = _hitl_burden(counts)
     return payload
@@ -537,9 +561,7 @@ def tool_get_report(
     out_dir = resolve_out_dir(ws, Path(out) if out else None)
     report_md = out_dir / "report" / "report.md"
     metrics = out_dir / "report" / "metrics.json"
-    from autorefactor.freshness import freshness_payload
-
-    fresh = freshness_payload(workspace=ws, out_dir=out_dir if out_dir.is_dir() else None)
+    fresh, _items, _by_status, fingerprint_stale = _freshness_queue_snapshot(ws, out_dir)
     base: dict[str, Any] = {
         **_workspace_echo(info),
         "out_dir": str(out_dir),
@@ -548,6 +570,7 @@ def tool_get_report(
         "visuals_dir": str(out_dir / "report" / "visuals"),
     }
     base.update(fresh)
+    base["fingerprint_stale"] = fingerprint_stale
     is_stale = not fresh.get("fresh") and not fresh.get("apply_safe")
     payload = dict(base)
     payload["ok"] = True
@@ -602,11 +625,17 @@ def _queue_store(out_dir: Path) -> ChangesetStore:
     return ChangesetStore(v2)
 
 
-def _queue_counts(out_dir: Path, *, threshold: float) -> dict[str, int]:
+def _queue_counts(
+    out_dir: Path,
+    *,
+    threshold: float,
+    items: list | None = None,  # noqa: ANN001
+) -> dict[str, int]:
     from autorefactor.changesets.store import changeset_needs_hitl
     from autorefactor.queue import load_queue
 
-    items = load_queue(out_dir)
+    if items is None:
+        items = load_queue(out_dir)
     done = skipped = blocked = pending = 0
     pending_autorun = pending_hitl = 0
     ids_done = {c.id for c in items if c.status == ChangesetStatus.DONE}
@@ -622,7 +651,7 @@ def _queue_counts(out_dir: Path, *, threshold: float) -> dict[str, int]:
             pending += 1
             deps_ok = all(dep in ids_done for dep in (c.depends_on or []))
             needs_hitl, _reason = changeset_needs_hitl(
-                c, threshold, deps_satisfied=deps_ok
+                c, threshold, deps_satisfied=deps_ok, queue=items
             )
             if needs_hitl:
                 pending_hitl += 1
@@ -740,9 +769,8 @@ def tool_sample_queue(
     threshold = float(config.confidence_threshold)
     cap = max(1, min(int(hitl_limit or 3), 8))
     from autorefactor.changesets.store import changeset_needs_hitl
-    from autorefactor.queue import load_queue
 
-    items = load_queue(out_dir)
+    fresh, items, _by_status, fingerprint_stale = _freshness_queue_snapshot(ws, out_dir)
     ids_done = {c.id for c in items if c.status == ChangesetStatus.DONE}
     pending = [
         c for c in items if c.status in {ChangesetStatus.PENDING, ChangesetStatus.IN_PROGRESS}
@@ -787,7 +815,7 @@ def tool_sample_queue(
         auto_items.sort(key=lambda pair: (-float(pair[0].confidence), pair[0].id))
         hitl_items.sort(key=lambda pair: (float(pair[0].confidence), pair[0].id))
 
-    counts = _queue_counts(out_dir, threshold=threshold)
+    counts = _queue_counts(out_dir, threshold=threshold, items=items)
     auto_sample = [
         _sample_queue_item(
             c, threshold=threshold, needs_confirmation=False, hitl_reason=reason
@@ -800,19 +828,33 @@ def tool_sample_queue(
         )
         for c, reason in hitl_items[:cap]
     ]
+    next_step = (
+        "Inspect auto_sample[0] and hitl_sample briefs. "
+        "Use get_changeset for full detail. Do not confirm or mark."
+    )
+    if not fresh.get("fresh"):
+        cta = fresh.get("re_analyze_cta") or (
+            "Run is stale — call analyze(background=true) before queue walk."
+        )
+        next_step = f"{cta} {next_step}"
     return {
         "ok": True,
         **_workspace_echo(info),
         "out_dir": str(out_dir),
         "confidence_threshold": threshold,
+        "allow_stale": False,
+        "fresh": fresh.get("fresh"),
+        "apply_safe": fresh.get("apply_safe"),
+        "metrics_review_ok": fresh.get("metrics_review_ok"),
+        "re_analyze_cta": fresh.get("re_analyze_cta"),
+        "stale_queue_invalidated": fresh.get("stale_queue_invalidated"),
+        "fingerprint_stale": fingerprint_stale,
+        "stale_warning": fresh.get("re_analyze_cta") if not fresh.get("fresh") else None,
         "queue_counts": counts,
         "hitl_burden": _hitl_burden(counts),
         "auto_sample": auto_sample,
         "hitl_sample": hitl_sample,
-        "next_step": (
-            "Inspect auto_sample[0] and hitl_sample briefs. "
-            "Use get_changeset for full detail. Do not confirm or mark."
-        ),
+        "next_step": next_step,
     }
 
 
