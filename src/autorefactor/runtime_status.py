@@ -199,10 +199,12 @@ def status_html(payload: dict[str, Any] | None = None) -> str:
         {
             "mcpServers": {
                 "autorefactor": {
-                    "command": "autorefactor-mcp",
+                    "command": "/path/to/autorefactor/.venv/bin/python",
+                    "args": ["-m", "autorefactor.mcp.server"],
                     "env": {
                         "AUTOREFACTOR_REMOTE_URL": "http://127.0.0.1:8765",
                         "AUTOREFACTOR_MCP_TRANSPORT": "stdio",
+                        "AUTOREFACTOR_DOCKER_CONTAINER": "autorefactor",
                     },
                 }
             }

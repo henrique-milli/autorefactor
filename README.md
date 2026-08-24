@@ -26,7 +26,29 @@ docker compose up -d --build
 Health: [http://localhost:3000](http://localhost:3000) (UI) and [http://localhost:8765](http://localhost:8765) (engine).
 
 1. Open [http://localhost:3000/settings](http://localhost:3000/settings) and paste an OpenAI-compatible API key (template: **Fast cloud**).
-2. Add the stdio proxy to your editor so the **project you have open** syncs to the engine (Cursor example):
+2. Add the stdio proxy to your editor so the **project you have open** syncs to the engine (Cursor example).
+
+Use an **absolute path** to the venv you created with `uv sync` in this repo. Cursor starts MCP without that repo as cwd, so bare `uv run autorefactor-mcp` often fails when your editor workspace is a different project.
+
+```json
+{
+  "mcpServers": {
+    "autorefactor": {
+      "command": "/path/to/autorefactor/.venv/bin/python",
+      "args": ["-m", "autorefactor.mcp.server"],
+      "env": {
+        "AUTOREFACTOR_REMOTE_URL": "http://127.0.0.1:8765",
+        "AUTOREFACTOR_MCP_TRANSPORT": "stdio",
+        "AUTOREFACTOR_DOCKER_CONTAINER": "autorefactor"
+      }
+    }
+  }
+}
+```
+
+Replace `/path/to/autorefactor` with your clone (e.g. `/home/you/Git/hmd/autorefactor`). `AUTOREFACTOR_DOCKER_CONTAINER` matches the Compose service name; omit it if you use the default `autorefactor`.
+
+**Alternative** (only when this repo is on PATH after `uv sync`, or your MCP `cwd` is the autorefactor clone):
 
 ```json
 {
@@ -43,7 +65,7 @@ Health: [http://localhost:3000](http://localhost:3000) (UI) and [http://localhos
 }
 ```
 
-`uv run autorefactor-mcp` is the primary path. After `uv sync`, `autorefactor-mcp` on PATH also works. Why `command` instead of hitting `/mcp` in the browser? The local process can see your cwd and upload uncommitted work; a bare HTTP MCP only sees the container workspace.
+Why stdio instead of hitting `/mcp` in the browser? The local process can see your cwd and upload uncommitted work; a bare HTTP MCP only sees the container workspace.
 
 3. Open **your** messy project in the editor (not this product repo unless that is what you want analyzed). [http://localhost:3000/runs](http://localhost:3000/runs) stays empty until an agent runs `analyze`.
 
