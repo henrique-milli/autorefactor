@@ -26,11 +26,20 @@ def _tool_list() -> list[dict[str, Any]]:
         {
             "name": "sync_workspace",
             "description": (
-                "Force re-upload of the open project to the analysis server. "
-                "Normally unnecessary — analyze syncs automatically when using local "
-                "autorefactor-mcp with AUTOREFACTOR_REMOTE_URL."
+                "Upload a local project to the remote engine (tar.gz over HTTP). "
+                "Pass path='/absolute/path/to/project'. No git required. "
+                "CLI equivalent: autorefactor sync -w PATH. Required before analyze "
+                "when cwd is not the project root."
             ),
-            "inputSchema": {"type": "object", "properties": {}},
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path to the local project directory to upload.",
+                    },
+                },
+            },
         },
         {
             "name": "prepare_workspace",
@@ -138,17 +147,20 @@ def _tool_list() -> list[dict[str, Any]]:
         {
             "name": "analyze",
             "description": (
-                "Analyze the open project. cwd syncs automatically with stdio MCP. "
-                "describe_mode=raw|describe (no write during analyze). In-source docs via "
-                "document prep changesets (proceed; describe_mode=describe applies generated "
-                "text). For long runs set background=true and poll get_progress."
+                "Analyze a local project on the remote engine. Pass path='/absolute/path/to/project' "
+                "(syncs via tar upload unless product bind-mount). describe_mode=raw|describe. "
+                "For long runs set background=true and poll get_progress."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute local project path to sync and analyze.",
+                    },
                     "workspace": {
                         "type": "string",
-                        "description": "Omit for default (synced open project). Rarely needed.",
+                        "description": "Remote selector only: active|mounted. Do not pass host paths.",
                     },
                     "out": {"type": "string"},
                     "skip_llm": {"type": "boolean"},
@@ -159,7 +171,7 @@ def _tool_list() -> list[dict[str, Any]]:
                     "focus": {"type": "string"},
                     "background": {
                         "type": "boolean",
-                        "description": "If true, return job_id immediately; poll get_progress.",
+                        "description": "Default true: return job_id immediately; poll get_progress.",
                     },
                 },
             },
@@ -240,8 +252,8 @@ def _tool_list() -> list[dict[str, Any]]:
             "name": "sample_queue",
             "description": (
                 "Read-only queue peek: HITL burden, one auto_proceed sample, "
-                "and 1–3 lowest-confidence HITL items with hitl_digest. Does not "
-                "confirm, mark, or change queue status."
+                "and 1–3 lowest-confidence HITL items with hitl_review (snippets + choices). "
+                "Does not confirm, mark, or change queue status."
             ),
             "inputSchema": {
                 "type": "object",
@@ -271,8 +283,9 @@ def _tool_list() -> list[dict[str, Any]]:
             "name": "get_next_changeset",
             "description": (
                 "Next pending changeset (ensure_tests/document prep ordered first). "
-                "auto_proceed when confidence ≥ threshold; needs_confirmation + hitl_digest "
-                "when low."
+                "auto_proceed when confidence ≥ threshold or UI user_decision=proceed; "
+                "needs_confirmation + hitl_review (code snippets, rationale, choices) when "
+                "judgment required."
             ),
             "inputSchema": {
                 "type": "object",
@@ -356,7 +369,7 @@ def dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if name == "workspace_status":
         return T.tool_workspace_status()
     if name == "sync_workspace":
-        return T.tool_sync_workspace()
+        return T.tool_sync_workspace(arguments.get("path"))
     if name == "prepare_workspace":
         return T.tool_prepare_workspace(
             arguments.get("git_url"),
@@ -388,7 +401,8 @@ def dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             bool(arguments.get("skip_llm")),
             arguments.get("describe_mode"),
             arguments.get("focus"),
-            bool(arguments.get("background")),
+            bool(arguments.get("background", True)),
+            arguments.get("path"),
         )
     if name == "get_analyze_job":
         return T.tool_get_analyze_job(arguments["job_id"])
@@ -466,9 +480,9 @@ def _register_tools(mcp: Any) -> None:
         return T.tool_workspace_status()
 
     @mcp.tool()
-    def sync_workspace() -> dict:
-        """Force re-upload of the open project (normally unnecessary — analyze syncs)."""
-        return T.tool_sync_workspace()
+    def sync_workspace(path: str | None = None) -> dict:
+        """Upload local project tree to remote engine. Pass path='/abs/path/to/project'."""
+        return T.tool_sync_workspace(path)
 
     @mcp.tool()
     def prepare_workspace(
@@ -517,15 +531,18 @@ def _register_tools(mcp: Any) -> None:
 
     @mcp.tool()
     def analyze(
+        path: str | None = None,
         workspace: str | None = None,
         out: str | None = None,
         skip_llm: bool = False,
         describe_mode: str | None = None,
         focus: str | None = None,
-        background: bool = False,
+        background: bool = True,
     ) -> dict:
-        """Analyze the open project (auto-synced). describe_mode=raw|describe (no source writes)."""
-        return T.tool_analyze(workspace, out, skip_llm, describe_mode, focus, background)
+        """Sync path= then analyze on remote. background=true returns job_id immediately."""
+        return T.tool_analyze(
+            workspace, out, skip_llm, describe_mode, focus, background, path
+        )
 
     @mcp.tool()
     def list_jobs(limit: int = 20, status: str | None = None) -> dict:
@@ -628,6 +645,7 @@ def _register_tools(mcp: Any) -> None:
 
 
 def _register_http_routes(mcp: Any) -> None:
+    from starlette.concurrency import run_in_threadpool
     from starlette.requests import Request
     from starlette.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
 
@@ -666,7 +684,7 @@ def _register_http_routes(mcp: Any) -> None:
 
     @mcp.custom_route("/v1/workspace", methods=["GET"])
     async def workspace_get(_request: Request) -> Response:
-        return JSONResponse(workspace_status())
+        return JSONResponse(await run_in_threadpool(workspace_status))
 
     @mcp.custom_route("/v1/workspace/sync", methods=["POST"])
     async def workspace_sync(request: Request) -> Response:
@@ -686,7 +704,7 @@ def _register_http_routes(mcp: Any) -> None:
                 data = await request.body()
             if not data:
                 return JSONResponse({"ok": False, "error": "empty body"}, status_code=400)
-            result = import_tar_gz(data, label=label, source=source)
+            result = await run_in_threadpool(import_tar_gz, data, label=label, source=source)
             return JSONResponse(result)
         except Exception as exc:  # noqa: BLE001
             return JSONResponse({"ok": False, "error": str(exc)[:500]}, status_code=400)
@@ -697,7 +715,7 @@ def _register_http_routes(mcp: Any) -> None:
         paths_raw = request.query_params.get("paths")
         paths = [p.strip() for p in paths_raw.split(",") if p.strip()] if paths_raw else None
         try:
-            data = export_active_tar_gz(paths=paths)
+            data = await run_in_threadpool(export_active_tar_gz, paths=paths)
         except RuntimeError as exc:
             return JSONResponse({"ok": False, "error": str(exc)[:500]}, status_code=404)
         assert isinstance(data, (bytes, bytearray))
@@ -742,7 +760,8 @@ def _register_http_routes(mcp: Any) -> None:
     async def status_get(request: Request) -> Response:
         workspace = request.query_params.get("workspace")
         out = request.query_params.get("out")
-        return _json(T.tool_get_status(workspace, out), request=request)
+        payload = await run_in_threadpool(T.tool_get_status, workspace, out)
+        return _json(payload, request=request)
 
     @mcp.custom_route("/v1/workspace/git", methods=["POST"])
     async def workspace_git(request: Request) -> Response:
@@ -822,6 +841,52 @@ def _register_http_routes(mcp: Any) -> None:
             return _json({"ok": False, "error": "not_found"}, status_code=404, request=request)
         data = runs_api.load_changesets(slug) or []
         return _json({"ok": True, "changesets": data}, request=request)
+
+    @mcp.custom_route(
+        "/v1/runs/{slug}/changesets/{changeset_id}",
+        methods=["PATCH", "OPTIONS"],
+    )
+    async def runs_changeset_decision(request: Request) -> Response:
+        if request.method == "OPTIONS":
+            return _options(request, allow_mutations=True)
+        slug = request.path_params.get("slug") or ""
+        changeset_id = request.path_params.get("changeset_id") or ""
+        if runs_api.resolve_run_dir(slug) is None:
+            return _json(
+                {"ok": False, "error": "not_found"},
+                status_code=404,
+                request=request,
+                allow_mutations=True,
+            )
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return _json(
+                {"ok": False, "error": "invalid JSON"},
+                status_code=400,
+                request=request,
+                allow_mutations=True,
+            )
+        if not isinstance(body, dict):
+            return _json(
+                {"ok": False, "error": "invalid JSON"},
+                status_code=400,
+                request=request,
+                allow_mutations=True,
+            )
+        decision = body.get("decision")
+        if decision is not None and not isinstance(decision, str):
+            return _json(
+                {"ok": False, "error": "decision must be string or null"},
+                status_code=400,
+                request=request,
+                allow_mutations=True,
+            )
+        result = runs_api.apply_changeset_decision(slug, changeset_id, decision)
+        status = 200 if result.get("ok") else (
+            404 if result.get("error") in {"not_found", "changeset_not_found"} else 400
+        )
+        return _json(result, status_code=status, request=request, allow_mutations=True)
 
     @mcp.custom_route("/v1/runs/{slug}/units", methods=["GET", "OPTIONS"])
     async def runs_units(request: Request) -> Response:

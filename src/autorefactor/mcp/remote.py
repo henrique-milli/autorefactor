@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 from autorefactor.sync_client import pull_workspace_http, sync_workspace_http
-from autorefactor.workspace_sync import mounted_workspace_dir
 
 _HEADERS = {
     "Content-Type": "application/json",
@@ -20,7 +19,25 @@ _session_id: str | None = None
 _req_id = 0
 _last_sync_fingerprint: str | None = None
 _last_sync_at: float = 0.0
+_last_sync_root: Path | None = None
 _pulled_job_ids: set[str] = set()
+
+
+class SyncRootError(RuntimeError):
+    """Local project path for upload could not be resolved."""
+
+
+_PROJECT_MARKERS = (
+    "pyproject.toml",
+    "pom.xml",
+    "package.json",
+    "go.mod",
+    "build.gradle",
+    "build.gradle.kts",
+    "Cargo.toml",
+    "Gemfile",
+    "composer.json",
+)
 
 
 def remote_base_url() -> str | None:
@@ -74,27 +91,6 @@ def _discover_eval_subject(start: Path) -> Path | None:
     return None
 
 
-def _autorefactor_repo_root(path: Path) -> Path | None:
-    cur = path.resolve()
-    if (cur / "src" / "autorefactor").is_dir() and (cur / "pyproject.toml").is_file():
-        return cur
-    return None
-
-
-def _single_eval_subject(repo_root: Path) -> Path | None:
-    subjects = repo_root / "eval" / "subjects"
-    if not subjects.is_dir():
-        return None
-    episodes = [
-        p.resolve()
-        for p in subjects.iterdir()
-        if p.is_dir() and _is_eval_subject_dir(p)
-    ]
-    if len(episodes) == 1:
-        return episodes[0]
-    return None
-
-
 def _is_product_checkout(path: Path) -> bool:
     """True when ``path`` is the autorefactor product repo, not an eval subject copy."""
     root = path.resolve()
@@ -106,25 +102,131 @@ def _is_product_checkout(path: Path) -> bool:
     return (root / "src" / "autorefactor").is_dir() and (root / "pyproject.toml").is_file()
 
 
-def _local_workspace_root() -> Path:
-    env = (os.environ.get("AUTOREFACTOR_MCP_WORKSPACE") or "").strip()
-    if env:
-        path = Path(env).expanduser()
-        if path.is_dir():
-            return path.resolve()
-    cwd = Path.cwd().resolve()
-    discovered = _discover_eval_subject(cwd)
+def _remote_workspace_for_local(local_root: Path, workspace: str | None = None) -> str:
+    """Map host workspace intent to a path the remote engine can resolve.
+
+    The autorefactor product repo is bind-mounted at ``/workspace`` in Docker.
+    Do not analyze stale ``active`` sync copies (demo eval subjects) for it.
+    Other projects are tar-synced into ``active`` on the remote.
+    Host-only absolute paths are never forwarded — remote cannot see them.
+    """
+    raw = (workspace or "").strip()
+    if _is_product_checkout(local_root):
+        return "mounted"
+    if raw in {"active", "synced", "remote"}:
+        return raw
+    if raw in {"", "default", ".", "mounted"}:
+        return "active"
+    if raw and Path(raw).expanduser().is_absolute():
+        return "active"
+    return "active"
+
+
+def _sync_skipped_meta(local_root: Path, *, reason: str) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "skipped": True,
+        "reason": reason,
+        "root": str(local_root),
+        "label": local_root.name,
+        "source": str(local_root),
+        "pack": {"file_count": 0},
+    }
+
+
+def _has_project_markers(path: Path) -> bool:
+    root = path.resolve()
+    if _is_product_checkout(root) or _is_eval_subject_dir(root):
+        return True
+    if any((root / name).exists() for name in _PROJECT_MARKERS):
+        return True
+    if (root / ".git").exists():
+        return True
+    try:
+        return any(root.iterdir())
+    except OSError:
+        return False
+
+
+def _resolve_workspace_candidate(path: Path) -> Path:
+    """Normalize a directory to the tree that should be packed."""
+    root = path.resolve()
+    if not root.is_dir():
+        raise SyncRootError(f"path is not a directory: {root}")
+    if _is_product_checkout(root):
+        return root
+    discovered = _discover_eval_subject(root)
     if discovered is not None:
         return discovered
-    repo = _autorefactor_repo_root(cwd)
-    if repo is not None:
-        single = _single_eval_subject(repo)
-        if single is not None:
-            return single
-    mounted = mounted_workspace_dir()
-    if mounted.is_dir() and any(mounted.iterdir()):
-        return mounted.resolve()
-    return cwd
+    return root
+
+
+def resolve_sync_root(path: str | None = None) -> Path:
+    """Resolve the local project directory to upload to the remote engine.
+
+    Priority: explicit ``path`` argument > ``AUTOREFACTOR_MCP_WORKSPACE`` > cwd.
+    Does not depend on git or any IDE-specific environment.
+    """
+    raw = (path or "").strip()
+    if raw:
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = (Path.cwd() / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        return _resolve_workspace_candidate(candidate)
+
+    env = (os.environ.get("AUTOREFACTOR_MCP_WORKSPACE") or "").strip()
+    if env:
+        candidate = Path(env).expanduser().resolve()
+        if not candidate.is_dir():
+            raise SyncRootError(f"AUTOREFACTOR_MCP_WORKSPACE is not a directory: {candidate}")
+        return _resolve_workspace_candidate(candidate)
+
+    cwd = Path.cwd().resolve()
+    if not cwd.is_dir():
+        raise SyncRootError(
+            "No sync path: pass path='/absolute/path/to/project' or set AUTOREFACTOR_MCP_WORKSPACE."
+        )
+    if cwd == Path.home().resolve() or not _has_project_markers(cwd):
+        raise SyncRootError(
+            "No sync path: pass path='/absolute/path/to/project' "
+            f"(cwd {cwd} is not a recognizable project root)."
+        )
+    return _resolve_workspace_candidate(cwd)
+
+
+def _local_workspace_root(path: str | None = None) -> Path:
+    """Backward-compatible alias for :func:`resolve_sync_root`."""
+    return resolve_sync_root(path)
+
+
+def _extract_sync_path(args: dict[str, Any]) -> str | None:
+    """Read explicit local path from tool args (``path`` or absolute ``workspace``)."""
+    explicit = str(args.get("path") or "").strip()
+    if explicit:
+        return explicit
+    ws = str(args.get("workspace") or "").strip()
+    if ws:
+        candidate = Path(ws).expanduser()
+        if candidate.is_absolute() and candidate.is_dir():
+            return ws
+    return None
+
+
+def _resolve_proxy_local_root(args: dict[str, Any]) -> Path:
+    """Resolve local upload root for a proxied tool call."""
+    global _last_sync_root
+    explicit = _extract_sync_path(args)
+    if explicit:
+        root = resolve_sync_root(explicit)
+        _last_sync_root = root
+        return root
+    if _last_sync_root is not None:
+        return _last_sync_root
+    root = resolve_sync_root(None)
+    _last_sync_root = root
+    return root
 
 
 def _local_pack_identity(root: Path, sync_meta: dict[str, Any]) -> dict[str, Any]:
@@ -146,7 +248,9 @@ def _local_pack_identity(root: Path, sync_meta: dict[str, Any]) -> dict[str, Any
 
 def _remote_workspace_identity() -> dict[str, Any] | None:
     try:
-        status = call_remote_tool("workspace_status", {})
+        # Fail-fast: workspace_status is used for proxy routing decisions.
+        # Avoid blocking the whole MCP call if the remote is slow/unreachable.
+        status = call_remote_tool("workspace_status", {}, timeout=10.0)
     except Exception:  # noqa: BLE001
         return None
     if not isinstance(status, dict):
@@ -183,11 +287,11 @@ def _file_count_drift(
 
 
 def _fingerprint(root: Path) -> str:
-    """Content fingerprint so nested edits invalidate the 30s sync skip."""
-    from autorefactor.freshness import workspace_content_fingerprint
+    """Fast path+size+mtime fingerprint for the 30s sync skip (not freshness)."""
+    from autorefactor.extract.cache import repo_fingerprint
 
     try:
-        return workspace_content_fingerprint(root)
+        return repo_fingerprint(root)
     except Exception:  # noqa: BLE001
         try:
             return f"{root.resolve()}:{root.stat().st_mtime_ns}"
@@ -195,20 +299,26 @@ def _fingerprint(root: Path) -> str:
             return str(root)
 
 
-def ensure_remote_workspace(*, force: bool = False) -> dict[str, Any]:
+def ensure_remote_workspace(*, path: str | None = None, force: bool = False) -> dict[str, Any]:
     """Pack local workspace and POST to remote /v1/workspace/sync."""
-    global _last_sync_fingerprint, _last_sync_at
+    global _last_sync_fingerprint, _last_sync_at, _last_sync_root
     base = remote_base_url()
     if not base:
         raise RuntimeError("AUTOREFACTOR_REMOTE_URL is not set")
-    root = _local_workspace_root()
+    from autorefactor.mcp.engine_recovery import ensure_remote_engine
+
+    if not ensure_remote_engine():
+        raise RuntimeError("remote engine unreachable (health check failed after auto-restart)")
+    started = time.time()
+    root = resolve_sync_root(path)
+    _last_sync_root = root
+    remote_ws = _remote_workspace_for_local(root)
     if _is_product_checkout(root):
-        return {
-            "ok": True,
-            "skipped": True,
-            "reason": "product_repo",
-            "root": str(root),
-        }
+        meta = _sync_skipped_meta(root, reason="product_repo_mounted")
+        meta["local_root"] = str(root)
+        meta["remote_workspace"] = remote_ws
+        meta["duration_ms"] = int((time.time() - started) * 1000)
+        return meta
     fp = _fingerprint(root)
     now = time.time()
     if (
@@ -216,7 +326,16 @@ def ensure_remote_workspace(*, force: bool = False) -> dict[str, Any]:
         and _last_sync_fingerprint == fp
         and (now - _last_sync_at) < 30
     ):
-        return {"ok": True, "skipped": True, "fingerprint": fp, "root": str(root)}
+        return {
+            "ok": True,
+            "skipped": True,
+            "fingerprint": fp,
+            "root": str(root),
+            "local_root": str(root),
+            "remote_workspace": remote_ws,
+            "reason": "unchanged_recent",
+            "duration_ms": int((time.time() - started) * 1000),
+        }
     sync_url = f"{_api_base(base)}/v1/workspace/sync"
     from autorefactor.paths import load_sync_meta
 
@@ -224,23 +343,39 @@ def ensure_remote_workspace(*, force: bool = False) -> dict[str, Any]:
     label = str(existing.get("label") or "").strip()
     if not label or label.lower() in {"active", "workspace", "default", "mounted"}:
         label = root.name
-    result = sync_workspace_http(
-        root,
-        url=sync_url,
-        label=label,
-        source=str(existing.get("source") or root),
-    )
+
+    def _upload() -> dict[str, Any]:
+        return sync_workspace_http(
+            root,
+            url=sync_url,
+            label=label,
+            source=str(existing.get("source") or root),
+        )
+
+    try:
+        result = _upload()
+    except Exception:
+        global _session_id
+        _session_id = None
+        if not ensure_remote_engine():
+            raise
+        result = _upload()
     _last_sync_fingerprint = fp
     _last_sync_at = now
+    result["local_root"] = str(root)
+    result["remote_workspace"] = remote_ws
+    result["duration_ms"] = int((time.time() - started) * 1000)
+    result.setdefault("label", label)
+    result.setdefault("source", str(root))
     return result
 
 
-def pull_remote_workspace(*, paths: list[str] | None = None) -> dict[str, Any]:
+def pull_remote_workspace(*, paths: list[str] | None = None, path: str | None = None) -> dict[str, Any]:
     """Download remote active workspace into the local project root."""
     base = remote_base_url()
     if not base:
         raise RuntimeError("AUTOREFACTOR_REMOTE_URL is not set")
-    root = _local_workspace_root()
+    root = resolve_sync_root(path) if path else (_last_sync_root or resolve_sync_root(None))
     export_url = f"{_api_base(base)}/v1/workspace/export"
     return pull_workspace_http(root, url=export_url, paths=paths)
 
@@ -410,6 +545,7 @@ def _ensure_session() -> str:
             "capabilities": {},
             "clientInfo": {"name": "autorefactor-proxy", "version": "0.3.2"},
         },
+        timeout=10.0,
     )
     session = hdrs.get("mcp-session-id") or ""
     # notifications/initialized
@@ -427,7 +563,7 @@ def _ensure_session() -> str:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             resp.read()
     except urllib.error.HTTPError:
         pass
@@ -456,6 +592,27 @@ def _unwrap_tool_result(msg: Any) -> Any:
 
 
 def call_remote_tool(name: str, arguments: dict[str, Any] | None = None, *, timeout: float = 600.0) -> Any:
+    try:
+        return _call_remote_tool_once(name, arguments, timeout=timeout)
+    except (RuntimeError, TimeoutError, urllib.error.URLError) as exc:
+        detail = str(exc).lower()
+        if "timed out" not in detail and "remote end closed" not in detail and "http" not in detail:
+            raise
+        from autorefactor.mcp.engine_recovery import ensure_remote_engine
+
+        global _session_id
+        _session_id = None
+        if not ensure_remote_engine():
+            raise
+        return _call_remote_tool_once(name, arguments, timeout=timeout)
+
+
+def _call_remote_tool_once(
+    name: str,
+    arguments: dict[str, Any] | None = None,
+    *,
+    timeout: float = 600.0,
+) -> Any:
     session = _ensure_session()
     sid = None if session == "nosession" else session
     msg, _ = _rpc(
@@ -495,6 +652,16 @@ _PROXY_TOOLS = frozenset(
 )
 
 
+_BOOTSTRAP_SKIP_SYNC = frozenset(
+    {
+        "workspace_status",
+        "get_status",
+        "get_agent_playbook",
+        "get_setup_requirements",
+    }
+)
+
+
 def _timeout_for(name: str, arguments: dict[str, Any]) -> float:
     if name == "analyze" and arguments.get("background"):
         return 120.0
@@ -502,6 +669,10 @@ def _timeout_for(name: str, arguments: dict[str, Any]) -> float:
         return 1800.0
     if name in {"get_analyze_job", "get_progress", "list_jobs", "get_status"}:
         return 60.0
+    if name == "get_agent_playbook":
+        return 15.0
+    if name == "get_setup_requirements":
+        return 15.0
     if name == "prepare_workspace":
         return 300.0
     if name == "sync_workspace":
@@ -509,44 +680,144 @@ def _timeout_for(name: str, arguments: dict[str, Any]) -> float:
     return 600.0
 
 
-def proxy_tool(name: str, arguments: dict[str, Any] | None = None) -> Any:
+def _local_agent_playbook() -> dict[str, Any]:
+    from autorefactor.config_store import load_merged_config
+    from autorefactor.mcp.guidance import build_agent_guidance
+
+    config = load_merged_config()
+    guidance = build_agent_guidance(config)
+    return {
+        "ok": True,
+        "always_call_first": False,
+        "instructions_note": (
+            "Core workflow is in MCP InitializeResult.instructions; "
+            "this tool returns live chat/embed axes and setup detail."
+        ),
+        "chat_backend": guidance["chat_backend"],
+        "embed_backend": guidance["embed_backend"],
+        "parallel_llm": guidance["parallel_llm"],
+        "describe_mode": guidance["describe_mode"],
+        "embed_batch_size": guidance.get("embed_batch_size"),
+        "embed_concurrency": guidance.get("embed_concurrency"),
+        "effective_embed_parallel": guidance.get("effective_embed_parallel"),
+        "profile": guidance["profile"],
+        "workflow": guidance["workflow"],
+        "forbidden": guidance["forbidden"],
+        "freshness": guidance["freshness"],
+        "tools": guidance["tools"],
+        "needs_setup": guidance["needs_setup"],
+        "setup_hint": guidance.get("setup_hint"),
+        "setup": guidance["setup"],
+        "next_step": (
+            "Call get_status; analyze if stale or refresh requested; else follow queue workflow."
+        ),
+        "local": True,
+    }
+
+
+def _local_setup_requirements() -> dict[str, Any]:
+    from autorefactor.config_store import get_setup_requirements, load_merged_config
+
+    config = load_merged_config()
+    reqs = get_setup_requirements(config)
+    return {"needs_setup": bool(reqs), "requirements": reqs, "local": True}
+
+
+def proxy_tool_inprocess(name: str, arguments: dict[str, Any] | None = None) -> Any:
     """Sync dirty tree when needed, then forward the tool to the remote MCP."""
     args = dict(arguments or {})
     if name == "sync_workspace":
         try:
-            result = ensure_remote_workspace(force=True)
+            sync_path = _extract_sync_path(args)
+            result = ensure_remote_workspace(path=sync_path, force=True)
             result.setdefault("ok", True)
-            result["synced"] = True
-            result["next_step"] = "Call analyze (workspace is set automatically)."
+            result["synced"] = not result.get("skipped")
+            result["next_step"] = (
+                "Call analyze(path=<same>, background=true) or analyze without path "
+                "if this was the last sync."
+            )
             return result
+        except SyncRootError as exc:
+            return {
+                "ok": False,
+                "error": "sync_path_required",
+                "detail": str(exc),
+                "next_step": (
+                    "Pass path='/absolute/path/to/project' or set AUTOREFACTOR_MCP_WORKSPACE."
+                ),
+            }
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": "sync_failed", "detail": str(exc)[:500]}
     if name == "prepare_workspace":
         # Git prepare runs on the remote server itself
         return call_remote_tool(name, args, timeout=_timeout_for(name, args))
+    if name == "get_agent_playbook":
+        return _local_agent_playbook()
+    if name == "get_setup_requirements":
+        # Important: resolve setup requirements on the remote server, not locally.
+        # The stdio proxy runs on the host; keys/config may only exist inside the
+        # container where the engine actually runs.
+        return call_remote_tool(name, args, timeout=_timeout_for(name, args))
+    if name in _BOOTSTRAP_SKIP_SYNC and name != "workspace_status":
+        if name == "get_status":
+            try:
+                local_root = _resolve_proxy_local_root(args)
+            except SyncRootError as exc:
+                return {
+                    "ok": False,
+                    "error": "sync_path_required",
+                    "detail": str(exc),
+                    "next_step": (
+                        "Call sync_workspace(path='/absolute/path/to/project') first, "
+                        "or pass path= on get_status."
+                    ),
+                }
+            args["workspace"] = _remote_workspace_for_local(
+                local_root, str(args.get("workspace") or "")
+            )
+        return call_remote_tool(name, args, timeout=_timeout_for(name, args))
     if name in _PROXY_TOOLS and name != "workspace_status":
         try:
-            sync_meta = ensure_remote_workspace()
-        except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": "sync_failed", "detail": str(exc)[:500]}
-        local_root = _local_workspace_root()
-        local_id = _local_pack_identity(
-            local_root, sync_meta if isinstance(sync_meta, dict) else {}
-        )
-        remote_id = _remote_workspace_identity()
-        if remote_id is not None and _workspace_mismatch(local_id, remote_id):
+            local_root = _resolve_proxy_local_root(args)
+        except SyncRootError as exc:
             return {
                 "ok": False,
-                "error": "workspace_mismatch",
-                "local": local_id,
-                "remote": remote_id,
+                "error": "sync_path_required",
+                "detail": str(exc),
+                "next_step": (
+                    "Call sync_workspace(path='/absolute/path/to/project') before analyze "
+                    "or pass path= on this tool."
+                ),
             }
-        if remote_id is not None and _file_count_drift(local_id, remote_id):
-            try:
-                ensure_remote_workspace(force=True)
-            except Exception:  # noqa: BLE001
-                pass
-        # Remote analyzes the uploaded active copy
+        sync_path = _extract_sync_path(args)
+        try:
+            sync_meta = ensure_remote_workspace(path=sync_path, force=name == "analyze")
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": "sync_failed", "detail": str(exc)[:500]}
+        if not _is_product_checkout(local_root):
+            local_id = _local_pack_identity(
+                local_root, sync_meta if isinstance(sync_meta, dict) else {}
+            )
+            remote_id = _remote_workspace_identity()
+            if remote_id is not None and _workspace_mismatch(local_id, remote_id):
+                return {
+                    "ok": False,
+                    "error": "workspace_mismatch",
+                    "local": local_id,
+                    "remote": remote_id,
+                }
+            if remote_id is not None and _file_count_drift(local_id, remote_id):
+                try:
+                    ensure_remote_workspace(path=str(local_root), force=True)
+                except Exception:  # noqa: BLE001
+                    pass
+        # Never forward host absolute paths to remote — only remote selectors.
+        if _extract_sync_path(args):
+            args.pop("path", None)
+            ws = str(args.get("workspace") or "").strip()
+            if ws and Path(ws).expanduser().is_absolute():
+                args.pop("workspace", None)
+        # Remote analyzes mounted bind-mount (product repo) or uploaded active copy.
         if name in {
             "analyze",
             "get_analyze_job",
@@ -561,8 +832,6 @@ def proxy_tool(name: str, arguments: dict[str, Any] | None = None) -> Any:
             "mark_changeset",
             "confirm_changeset",
             "describe_unit",
-            "get_setup_requirements",
-            "get_agent_playbook",
             "list_enrich_tasks",
             "get_next_enrich_task",
             "submit_enrich_result",
@@ -571,9 +840,9 @@ def proxy_tool(name: str, arguments: dict[str, Any] | None = None) -> Any:
                 name == "get_progress" and bool(args.get("job_id"))
             )
             if not skip_workspace:
-                args.setdefault("workspace", "active")
-                if args.get("workspace") in {None, "", "default", "mounted", "."}:
-                    args["workspace"] = "active"
+                args["workspace"] = _remote_workspace_for_local(
+                    local_root, str(args.get("workspace") or "")
+                )
         result = call_remote_tool(name, args, timeout=_timeout_for(name, args))
         if name == "analyze":
             if isinstance(result, dict) and not result.get("background"):
@@ -593,9 +862,94 @@ def proxy_tool(name: str, arguments: dict[str, Any] | None = None) -> Any:
 
 def reset_proxy_state() -> None:
     """Test helper."""
-    global _session_id, _req_id, _last_sync_fingerprint, _last_sync_at, _pulled_job_ids
+    global _session_id, _req_id, _last_sync_fingerprint, _last_sync_at, _last_sync_root, _pulled_job_ids
     _session_id = None
     _req_id = 0
     _last_sync_fingerprint = None
     _last_sync_at = 0.0
+    _last_sync_root = None
     _pulled_job_ids = set()
+
+
+def _proxy_inprocess_enabled() -> bool:
+    return (os.environ.get("AUTOREFACTOR_PROXY_INPROCESS") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def proxy_tool(name: str, arguments: dict[str, Any] | None = None) -> Any:
+    """Run proxy in a fresh subprocess so stdio MCP picks up src edits without restart."""
+    if _proxy_inprocess_enabled():
+        return proxy_tool_inprocess(name, arguments)
+    import subprocess
+    import sys
+
+    payload = json.dumps({"name": name, "arguments": arguments or {}})
+    timeout = _timeout_for(name, arguments or {}) + 60.0
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "autorefactor.mcp.proxy_worker"],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=os.environ.copy(),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {"ok": False, "error": "proxy_timeout", "detail": str(exc)[:500]}
+    if proc.returncode != 0:
+        return {
+            "ok": False,
+            "error": "proxy_worker_failed",
+            "detail": (proc.stderr or proc.stdout or "")[:500],
+        }
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "proxy_bad_json", "detail": (proc.stdout or "")[:500]}
+
+
+def _proxy_inprocess_enabled() -> bool:
+    return (os.environ.get("AUTOREFACTOR_PROXY_INPROCESS") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def proxy_tool(name: str, arguments: dict[str, Any] | None = None) -> Any:
+    """Run proxy in a fresh subprocess so stdio MCP picks up src edits without restart."""
+    if _proxy_inprocess_enabled():
+        return proxy_tool_inprocess(name, arguments)
+    import subprocess
+    import sys
+
+    payload = json.dumps({"name": name, "arguments": arguments or {}})
+    timeout = _timeout_for(name, arguments or {}) + 60.0
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "autorefactor.mcp.proxy_worker"],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=os.environ.copy(),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {"ok": False, "error": "proxy_timeout", "detail": str(exc)[:500]}
+    if proc.returncode != 0:
+        return {
+            "ok": False,
+            "error": "proxy_worker_failed",
+            "detail": (proc.stderr or proc.stdout or "")[:500],
+        }
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "proxy_bad_json", "detail": (proc.stdout or "")[:500]}

@@ -360,13 +360,6 @@ class StubProvider(LLMProvider):
     """Deterministic offline provider for dry runs without API keys."""
 
     def chat_json(self, system: str, user: str, *, temperature: float = 0.2) -> dict:
-        # Heuristic: confirm similarity/smell flags unless marked trivial
-        if "false positive" in user.lower() or "getter" in user.lower():
-            return {
-                "valid": False,
-                "reasoning": "Looks like a trivial or false-positive signal.",
-                "action": "document",
-            }
         if (
             '"description"' in system
             or '"doc"' in system
@@ -458,6 +451,13 @@ class StubProvider(LLMProvider):
                         "rationale": "no flags",
                     }
                 ]
+            }
+        # Confirm-path heuristic: snippets in planning briefs may mention getters
+        if "false positive" in user.lower() or "getter" in user.lower():
+            return {
+                "valid": False,
+                "reasoning": "Looks like a trivial or false-positive signal.",
+                "action": "document",
             }
         return {
             "valid": True,

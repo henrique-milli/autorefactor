@@ -62,6 +62,12 @@ def estimate_metrics(
         )
 
     valid = [f for f in confirmed if f.valid]
+    trashed = [
+        f
+        for f in confirmed
+        if (f.disposition or ("trash" if not f.valid else None)) == "trash"
+        or (not f.valid and f.disposition != "review")
+    ]
     dropped_plan = [
         f
         for f in confirmed
@@ -216,6 +222,9 @@ def estimate_metrics(
             f"Coverage estimated only ({indexed} Jacoco files indexed)—"
             "run mvn test jacoco:report before trusting ensure_tests prep"
         )
+        gen_note = (coverage.summary or "") if coverage else ""
+        if "Coverage generate:" in gen_note:
+            warnings.append(gen_note.split("Coverage generate:", 1)[-1].strip())
     if not with_targets:
         warnings.append("Queue empty after planning — no structurally valid decisions.")
     elif (
@@ -330,6 +339,7 @@ def estimate_metrics(
             "raw_flag_count": raw_count if raw_count is not None else len(findings),
             "auto_rejected_flag_count": auto_rejected,
             "confirmed_count": len(valid),
+            "planner_trash_count": len(trashed),
             "confirmation_rate_percent": round(planner_coverage, 1),
             "planner_coverage_percent": round(planner_coverage, 1),
             "planner_dropped_count": len(dropped_plan),

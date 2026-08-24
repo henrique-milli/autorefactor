@@ -9,11 +9,13 @@ export function Sheet({
   onOpenChange,
   title,
   children,
+  wide = false,
 }: {
   open: boolean;
   onOpenChange: (o: boolean) => void;
   title: string;
   children: React.ReactNode;
+  wide?: boolean;
 }) {
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
@@ -21,7 +23,8 @@ export function Sheet({
         <Dialog.Overlay className="fixed inset-0 z-40 bg-ink/40" />
         <Dialog.Content
           className={cn(
-            "fixed right-0 top-0 z-50 flex h-full w-full max-w-md flex-col border-l border-line bg-card p-6 shadow-xl",
+            "fixed right-0 top-0 z-50 flex h-full w-full flex-col border-l border-line bg-card p-6 shadow-xl",
+            wide ? "max-w-3xl" : "max-w-md",
           )}
         >
           <div className="mb-4 flex items-center justify-between">

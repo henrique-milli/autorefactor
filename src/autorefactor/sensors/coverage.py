@@ -163,6 +163,17 @@ def enrich_coverage(
         snap = load_coverage_snapshot(workspace, repos)
     except Exception:  # noqa: BLE001 — never fail analyze on coverage import
         snap = None
+    generate_notes: list[str] = []
+    if snap is None or not snap.files:
+        from autorefactor.enrich.coverage_generate import try_generate_coverage_reports
+
+        gen = try_generate_coverage_reports(workspace, repos)
+        generate_notes = list(gen.get("notes") or [])
+        if int(gen.get("ran") or 0) > 0:
+            try:
+                snap = load_coverage_snapshot(workspace, repos)
+            except Exception:  # noqa: BLE001
+                snap = None
     if snap is None:
         snap = CoverageSnapshot(
             summary="No coverage report found in workspace",
@@ -172,6 +183,11 @@ def enrich_coverage(
             repos_without_coverage=[p.name for p in repos],
         )
     snap = _mark_estimated_when_tooling_only(snap, repos)
+    if generate_notes:
+        extra = "Coverage generate: " + "; ".join(generate_notes[:4])
+        snap = snap.model_copy(
+            update={"summary": ((snap.summary or "").strip() + " | " + extra).strip(" |")}
+        )
     if not snap.repos_without_coverage:
         # Ensure partial multi-repo gaps are listed even if parsers left it empty
         reported = set()

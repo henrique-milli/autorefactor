@@ -26,14 +26,19 @@ def build_agent_guidance(config: AutorefactorConfig) -> dict[str, Any]:
         "PHASE RULE: Between major phases, stop and guide the user with a short status + clear "
         "next-step question (CTA). Do not dump tools silently. Exception: while walking the "
         "changeset queue, do not stop on auto_proceed=true items.",
-        "Local edits: stdio MCP auto-syncs cwd (or sync_workspace). Fingerprint is the synced tree.",
+        "Local projects: call sync_workspace(path='/abs/path/to/project') then analyze(path=<same>, background=true). "
+        "No git required — upload is tar.gz over HTTP. CLI: autorefactor sync -w PATH. "
+        "On sync failure: use CLI `autorefactor sync -w PATH` then retry analyze — do not thrash alternate paths.",
         "Setup: Call get_status. If needs_setup=true, STOP and tell the user to add an API key at "
         f"{_UI_SETTINGS} (or switch to local agent+Ollama). Do not invent credentials.",
         "Analyze: If the user wants refactor/analyze OR fresh=false, call analyze(background=true) "
         "and poll until done. UI does not start analyze.",
         "After analyze finishes: Call get_report. Summarize headline metrics for the user. Give UI "
         f"links: {_UI_HOME}/runs (list), the run overview/ROI/map/queue pages for the new slug, "
-        f"engine {_ENGINE}/. Then ASK: continue to the next phase, or stop here?",
+        f"engine {_ENGINE}/. Always include the queue URL ({_UI_HOME}/runs/<slug>/queue): user can "
+        "Approve/Skip HITL there, then tell you to execute the approved items. "
+        "Mention prep coverage yes/no before any structural walk. "
+        "ASK: review/Approve in the UI now, continue to prep, or stop here?",
     ]
     if agent_chat:
         workflow.append(
@@ -52,37 +57,43 @@ def build_agent_guidance(config: AutorefactorConfig) -> dict[str, Any]:
             "`docker compose --profile ollama up -d` (Settings cannot start containers)."
         )
     describe = runtime.get("describe_mode") or "raw"
-    prep_docs = (
-        " (2) write generated unit descriptions into source (describe_mode=describe)?"
-        if describe == "describe"
-        else " (2) fill in-source doc gaps on document prep items (agent writes text)?"
-    )
+    if describe == "describe":
+        prep_docs = (
+            "Prep docs (optional, same prep stop): write generated unit descriptions into source "
+            "(describe_mode=describe)? If no: skip document prep. If yes: drain with auto_proceed "
+            "unless needs_confirmation (document only)."
+        )
+    else:
+        prep_docs = (
+            "Prep docs: describe_mode=raw — do not queue document prep (no generated text to apply). "
+            "Document ad hoc in source only if the user asks."
+        )
     workflow.extend(
         [
-            "Prep (before structural refactors) — ASK once: Queue orders ensure_tests then "
-            "document ahead of refactors so you can lock characterization coverage (and docs) "
-            "before changing code. Ask: (1) raise test coverage first?"
-            + prep_docs
-            + " If no: skip those prep changesets, then continue. If yes: drain prep items "
-            "first (high-confidence auto_proceed; HITL only when needs_confirmation). "
-            "document proceed writes docs"
-            + (
-                "; with describe_mode=describe the server applies generated descriptions."
-                if describe == "describe"
-                else "."
-            )
-            + " ensure_tests proceed scaffolds/expands tests. Do not treat write_docs / "
-            "ensure_full_coverage as bolt-ons on unrelated refactors.",
-            "Queue walk — ASK once: ready to walk the refactor queue? Only start after yes "
-            "(or the user already asked to walk the queue).",
+            "Prep coverage (ASK ONCE before queue walk): Warn that structural refactors are "
+            "queued without full test coverage. Ask exactly: 'You are about to refactor without "
+            "full test coverage. Push coverage to the limit on all flagged production code before "
+            "any structural refactors? (yes/no)'. If yes: drain every ensure_tests item with "
+            "auto_proceed — confirm_changeset(proceed) without asking per item. If no: "
+            "confirm_changeset(skip) on each ensure_tests without asking, then structural queue. "
+            "NEVER ask proceed/skip/blocked on individual ensure_tests — prep yes/no covers all.",
+            prep_docs,
+            "Queue walk — start only after prep coverage yes/no is answered (or user already "
+            "ordered queue walk). If the UI has Approve decisions pending, get_next returns only "
+            "those until drained; then resume normal HITL/autorun.",
             "While walking: get_next_changeset ONE AT A TIME (do not batch):",
             "  • auto_proceed=true: confirm_changeset(proceed) without asking, edit, "
-            "mark_changeset done, immediately fetch the next item — no mid-item CTA.",
-            "  • needs_confirmation=true: STOP, show hitl_digest, ask proceed/skip/blocked "
-            "before confirm_changeset.",
-            "  • loop=waiting / blocked_deps: not a user question — do not proceed; drain or "
-            "skip the blocking prep item first.",
-            "  • Respect depends_on. When queue done=true: report summary + CTA (review UI / stop).",
+            "mark_changeset done, immediately fetch the next item — no mid-item CTA "
+            "(includes UI-approved user_decision=proceed).",
+            "  • needs_confirmation=true: STOP, present hitl_review as a compact card — title, "
+            "model rationale (hitl_review.rationale / Why flagged), optional benefit, "
+            "code snippet(s); if compare_targets=true show both clones side-by-side, then ask "
+            "proceed/skip/blocked (never for ensure_tests). hitl_reason=plan_review means the "
+            "planner asked for human judgment (not a weak auto-keep). Or point user to Approve/Skip in "
+            "the queue UI, then execute when they return.",
+            "  • loop=waiting / blocked_deps: not a user question — drain or skip blocker first.",
+            "  • Respect depends_on. When queue done=true: remind to run the project test suite "
+            "once (mvn test / repo equivalent) before claiming done; then CTA (review UI / stop).",
         ]
     )
     forbidden = [
@@ -92,10 +103,12 @@ def build_agent_guidance(config: AutorefactorConfig) -> dict[str, Any]:
         "Do not skip phase CTAs (after analyze, before enrich, before prep, before queue) unless "
         "the user already ordered that phase in the same turn.",
         "Do not ask the user to confirm high-confidence (auto_proceed) changesets.",
+        "Do not ask proceed/skip/blocked on individual ensure_tests items — one prep coverage yes/no only.",
         "Do not bolt write_docs onto a document changeset (proceed is writing docs).",
         "Do not bolt ensure_full_coverage onto an ensure_tests changeset (proceed is the tests).",
         "Do not drain multiple changesets before finishing the current one.",
         "Do not skip or auto-decide needs_confirmation=true changesets without asking the user.",
+        "Do not present HITL as text-only — always show relevant code snippets from hitl_review.targets.",
         "Do not treat a stale report as current when the user asked to analyze/refresh.",
         "Do not start analyze from the UI narrative; agents use MCP analyze.",
     ]
@@ -106,15 +119,16 @@ def build_agent_guidance(config: AutorefactorConfig) -> dict[str, Any]:
         "get_next_enrich_task": "Next describe/plan task (agent chat). Ask before starting enrich phase.",
         "submit_enrich_result": "Submit JSON result for an enrich task id.",
         "get_next_changeset": (
-            "ONE at a time. Prep (ensure_tests/document) is ordered first. "
-            "auto_proceed → no ask; needs_confirmation → hitl_digest (must ask)."
+            "ONE at a time. ensure_tests always auto_proceed (prep coverage yes/no is the only gate). "
+            "UI user_decision=proceed → auto_proceed (do not re-ask). "
+            "Other needs_confirmation → hitl_review (structured card with snippets + choices)."
         ),
         "confirm_changeset": (
             "decision=proceed|skip|blocked. document+describe_mode=describe → writes docs; "
             "ensure_tests → scaffolds coverage work."
         ),
         "mark_changeset": "pending|in_progress|done|skipped|blocked",
-        "sync_workspace": "Force re-upload (usually unnecessary).",
+        "sync_workspace": "Upload local project: path='/abs/path/to/project' (tar.gz HTTP). CLI: autorefactor sync -w PATH.",
         "get_agent_playbook": "Optional: live axes + setup (workflow already in MCP instructions).",
     }
     hint = setup_hint(cfg)
@@ -163,7 +177,8 @@ def format_mcp_instructions(guidance: dict[str, Any] | None = None) -> str:
     embed = guidance.get("embed_backend", "")
     lines = [
         "autorefactor MCP — phase CTAs between analyze / enrich / prep / queue; "
-        "inside the queue only HITL on needs_confirmation (never on auto_proceed).",
+        "ensure_tests never per-item HITL (one prep coverage yes/no); other needs_confirmation only. "
+        "After analyze: give queue UI link for Approve/Skip, then execute when the user asks.",
         f"Runtime hint at server start: chat={chat} embed={embed}.",
     ]
     if guidance.get("needs_setup"):

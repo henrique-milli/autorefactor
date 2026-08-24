@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SCHEMA_VERSION = 2
+
+PlanDisposition = Literal["keep", "review", "trash"]
+_PLAN_DISPOSITIONS = frozenset({"keep", "review", "trash"})
 
 
 class UnitKind(str, Enum):
@@ -206,9 +209,39 @@ class PlannerDecision(BaseModel):
     confidence: float = 0.5
     finding_ids: list[str] = Field(default_factory=list)
     unit_ids: list[str] = Field(default_factory=list)
-    valid: bool = True
+    disposition: PlanDisposition = "trash"
+    valid: bool = False
     estimated_loc_delta: int = 0
     goal: AnalysisGoal | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_disposition(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        raw = str(data.get("disposition") or "").strip().lower()
+        if raw in _PLAN_DISPOSITIONS:
+            data["disposition"] = raw
+            data["valid"] = raw != "trash"
+            return data
+        # Legacy: explicit valid without disposition.
+        if "disposition" not in data and "valid" in data:
+            keep = bool(data.get("valid"))
+            data["disposition"] = "keep" if keep else "trash"
+            data["valid"] = keep
+            return data
+        # Safe default: trash (do not rubber-stamp keep).
+        data["disposition"] = "trash"
+        data["valid"] = False
+        return data
+
+    @model_validator(mode="after")
+    def _sync_valid_from_disposition(self) -> PlannerDecision:
+        expected = self.disposition != "trash"
+        if self.valid != expected:
+            return self.model_copy(update={"valid": expected})
+        return self
 
 
 class UnitAgendaEntry(BaseModel):
@@ -231,6 +264,8 @@ class UnitCard(BaseModel):
     path: str
     qualified_name: str
     description: str = ""
+    source_snippet: str = ""
+    sibling_methods: list[str] = Field(default_factory=list)
 
 
 class PlanningBrief(BaseModel):
@@ -249,6 +284,7 @@ class ConfirmedFinding(BaseModel):
     valid: bool
     reasoning: str
     refined_action: SuggestedAction | None = None
+    disposition: PlanDisposition | None = None
 
     @model_validator(mode="before")
     @classmethod

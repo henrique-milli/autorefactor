@@ -61,8 +61,10 @@ def test_plan_findings_covers_all_in_large_component() -> None:
             span=CodeSpan(start_line=1, end_line=1),
         )
     ]
-    # Stub chat_json returns only first finding — fallback must cover the rest
     findings = [_finding(f"f{i}", "shared") for i in range(12)]
+    findings[0] = findings[0].model_copy(update={"score": 0.85})
+    for i in range(1, 12):
+        findings[i] = findings[i].model_copy(update={"score": 0.2})
 
     class PartialStub(StubProvider):
         def chat_json(self, system: str, user: str, **kwargs):  # noqa: ANN003
@@ -85,9 +87,99 @@ def test_plan_findings_covers_all_in_large_component() -> None:
         findings, units, PartialStub(), max_component_size=8
     )
     selected = {c.finding.id for c in confirmed if c.valid}
-    assert len(selected) == 12
-    assert not any("Dropped during plan" in (c.reasoning or "") for c in confirmed)
+    assert findings[0].id in selected
+    dropped = [c for c in confirmed if not c.valid]
+    assert dropped
+    assert all(c.finding.score < 0.6 for c in dropped)
     assert len(changesets) >= 1
+
+
+def test_plan_llm_valid_false_drops_changeset() -> None:
+    units = [
+        CodeUnit(
+            id="u1",
+            repo="r",
+            path="GetName.java",
+            qualified_name="Bean.getName",
+            kind=UnitKind.FUNCTION,
+            language="java",
+            source_snippet="public String getName() { return name; }",
+            content_hash=content_hash("g"),
+            span=CodeSpan(start_line=1, end_line=1),
+        )
+    ]
+    finding = _finding("fp-1", "u1")
+    finding = finding.model_copy(
+        update={"score": 0.22, "title": "clone of getter", "evidence": "name similarity"}
+    )
+
+    class RejectStub(StubProvider):
+        def chat_json(self, system: str, user: str, **kwargs):  # noqa: ANN003
+            assert "snippet:" in user
+            assert "getName" in user
+            return {
+                "decisions": [
+                    {
+                        "title": "false-positive getter",
+                        "action": "split",
+                        "rationale": "trivial getter",
+                        "confidence": 0.1,
+                        "finding_ids": [finding.id],
+                        "unit_ids": ["u1"],
+                        "valid": False,
+                    }
+                ]
+            }
+
+    confirmed, changesets, decisions, _agenda = plan_findings(
+        [finding], units, RejectStub()
+    )
+    assert changesets == []
+    assert decisions and decisions[0].valid is False
+    assert all(not c.valid for c in confirmed)
+
+
+def test_plan_brief_includes_source_snippet() -> None:
+    units = [
+        CodeUnit(
+            id="u1",
+            repo="r",
+            path="A.java",
+            qualified_name="A.foo",
+            kind=UnitKind.FUNCTION,
+            language="java",
+            source_snippet="void foo() { return 42; }",
+            content_hash=content_hash("s"),
+            span=CodeSpan(start_line=1, end_line=1),
+        )
+    ]
+    finding = _finding("s1", "u1").model_copy(update={"score": 0.21})
+    seen: dict[str, str] = {}
+
+    class CaptureStub(StubProvider):
+        def chat_json(self, system: str, user: str, **kwargs):  # noqa: ANN003
+            seen["system"] = system
+            seen["user"] = user
+            return {
+                "decisions": [
+                    {
+                        "title": "keep",
+                        "action": "split",
+                        "rationale": "ok",
+                        "confidence": 0.7,
+                        "finding_ids": [finding.id],
+                        "unit_ids": ["u1"],
+                        "valid": True,
+                    }
+                ]
+            }
+
+    plan_findings([finding], units, CaptureStub())
+    assert "snippet:" in seen["user"]
+    assert "void foo() { return 42; }" in seen["user"]
+    assert "disposition" in seen["system"].lower()
+    assert "trash" in seen["system"].lower()
+
 
 
 def test_dedupe_changesets_keeps_higher_confidence() -> None:

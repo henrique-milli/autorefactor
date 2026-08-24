@@ -10,9 +10,12 @@ from autorefactor.domain import CodeSpan, CodeUnit, UnitKind, content_hash
 from autorefactor.report.metrics import estimate_metrics, write_metrics_and_report
 from autorefactor.report.roi import (
     agent_friction_score,
+    changeset_why,
     composite_debt_score,
     compute_debt_components,
     per_task_agent_gains,
+    plain_english_upside,
+    upside_kind,
     value_score,
 )
 from autorefactor.report.visuals import generate_visuals, write_embedding_projection
@@ -281,3 +284,39 @@ def test_visual_smoke_tsne_clone_edges(tmp_path: Path) -> None:
     proj = json.loads((report_dir / "projection.json").read_text(encoding="utf-8"))
     assert proj["method"] in {"pca3", "tsne3"}
     assert proj["point_count"] >= 5
+
+
+def test_draft_map_upside_is_not_fake_clone_share() -> None:
+    cs = Changeset(
+        id="d1",
+        title="Draft in-memory mapping",
+        action="extract_shared",
+        brief="## markdown plan brief that should not be the why",
+        rationale="HashMap defaults without config — silent skip risk on unmapped assets.",
+        confidence=0.76,
+        targets=[ChangesetTarget(repo="r", path="A.java", unit_id="u1")],
+        metrics_delta={"kind": "draft_in_memory_map", "estimated_loc_removed": 22},
+    )
+    assert upside_kind(cs) == "slop"
+    assert changeset_why(cs).startswith("HashMap defaults")
+    benefit = plain_english_upside(cs)
+    assert "Share/delete" not in benefit
+    assert "HashMap" in benefit or "config" in benefit
+
+
+def test_multi_target_dedup_keeps_share_delete_copy() -> None:
+    cs = Changeset(
+        id="d2",
+        title="Delete duplicates",
+        action="delete_duplicate",
+        brief="b",
+        rationale="Near-identical handlers.",
+        confidence=0.8,
+        targets=[
+            ChangesetTarget(repo="r", path="A.java", unit_id="u1"),
+            ChangesetTarget(repo="r", path="B.java", unit_id="u2"),
+        ],
+        metrics_delta={"estimated_loc_removed": 30},
+    )
+    assert upside_kind(cs) == "dedup"
+    assert "Share/delete ~30 LOC" in plain_english_upside(cs)

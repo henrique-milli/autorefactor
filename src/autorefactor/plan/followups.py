@@ -52,8 +52,12 @@ def _coverage_needs_tests(
     threshold: float,
     existing_tests: list[str] | None = None,
 ) -> bool:
-    if existing_tests and unit_has_characterization_test(unit, existing_tests):
-        return False
+    """Whether ensure_tests should target this unit.
+
+    Measured % under threshold always needs work (even if *Test.java exists).
+    Measured % at/above threshold does not. Without a measured match, an existing
+    characterization suite short-circuits; unmatched files stay uncovered.
+    """
     if coverage is None:
         return False
     if _coverage_is_estimated(coverage):
@@ -65,26 +69,27 @@ def _coverage_needs_tests(
         return False
     if unit.repo in (coverage.repos_without_coverage or []) and not coverage.files:
         return False
-    path = unit.path.replace("\\", "/")
-    matched = False
+
+    from autorefactor.coverage_paths import coverage_path_matches
+
+    matched_pct: float | None = None
     for st in coverage.files or []:
         sp = (st.path or "").replace("\\", "/")
-        if (
-            sp == path
-            or sp.endswith("/" + path)
-            or sp.endswith(path)
-            or path.endswith(sp)
-            or f"{unit.repo}/{path}" == sp
-            or sp.endswith(f"{unit.repo}/{path}")
-        ):
-            matched = True
-            if float(st.percent) < threshold:
-                return True
-    if coverage.files and not matched:
+        if coverage_path_matches(unit.path, sp, repo=unit.repo):
+            matched_pct = float(st.percent)
+            break
+
+    if matched_pct is not None:
+        return matched_pct < threshold
+
+    # No measured match for this unit.
+    if existing_tests and unit_has_characterization_test(unit, existing_tests):
+        return False
+    if coverage.files:
         # File absent from report → treat as uncovered when reports exist
         return True
     if coverage.overall_percent is not None and float(coverage.overall_percent) < threshold:
-        return not matched
+        return True
     return False
 
 
@@ -204,7 +209,15 @@ def _remap_primary_ensure_tests(
             if u.id in seen or is_test_target_unit(u):
                 continue
             if existing_tests and unit_has_characterization_test(u, existing_tests):
-                continue
+                # Low measured coverage still needs ensure even when *Test.java exists.
+                if not _coverage_needs_tests(
+                    u,
+                    coverage,
+                    threshold=coverage_threshold,
+                    existing_tests=existing_tests,
+                ):
+                    if not draft:
+                        continue
             seen.add(u.id)
             final.append(u)
 
@@ -372,7 +385,14 @@ def _resolve_ensure_test_units(
     for u in cov_units:
         if u.id in seen or is_test_target_unit(u):
             continue
-        if existing_tests and unit_has_characterization_test(u, existing_tests):
+        if _coverage_needs_tests(
+            u,
+            coverage,
+            threshold=coverage_threshold,
+            existing_tests=existing_tests,
+        ):
+            pass
+        elif existing_tests and unit_has_characterization_test(u, existing_tests):
             if not _keep_prep_unit_despite_existing_test(
                 u,
                 existing_tests,
@@ -382,6 +402,9 @@ def _resolve_ensure_test_units(
                 target_unit_ids=target_unit_ids,
             ):
                 continue
+        elif coverage is not None and coverage.files and not draft:
+            # Measured OK or otherwise not needing tests — drop.
+            continue
         seen.add(u.id)
         out.append(u)
     return out
@@ -462,7 +485,9 @@ def _ensure_tests_brief(
     return (
         f"## {title}\n\n"
         f"Action: `ensure_tests`\n"
-        f"Raise characterization coverage for production units below {threshold:.0f}%.\n\n"
+        f"Write or expand characterization tests for the listed targets until "
+        f"Jacoco-relevant behavior is covered (threshold {threshold:.0f}%). "
+        f"A test class existing is not enough — raise measured coverage on the production units.\n\n"
         "**Do not expand Jacoco padding / symbol-exists-only tests.**"
         f"{index_note}{matrix_note}\n\n"
         f"### Resolved targets\n{target_lines or '(no production units resolved)'}\n\n"
@@ -996,6 +1021,89 @@ def _batch_document_followup(group: list[Changeset]) -> Changeset:
     )
 
 
+def _batch_ensure_tests_prep(changesets: list[Changeset]) -> list[Changeset]:
+    """Merge all ensure_tests into one prep item — user decides yes/no once at prep phase."""
+    ensure_all = [
+        c for c in changesets if (c.action or "").strip().lower() == "ensure_tests"
+    ]
+    if len(ensure_all) <= 1:
+        return changesets
+    old_ids = {c.id for c in ensure_all}
+    seen_units: dict[str, ChangesetTarget] = {}
+    evidence: list[str] = []
+    for cs in ensure_all:
+        for ref in cs.evidence_refs or []:
+            if ref not in evidence:
+                evidence.append(ref)
+        for t in cs.targets or []:
+            key = t.unit_id or f"{t.repo}:{t.path}:{t.symbol}"
+            if key not in seen_units:
+                seen_units[key] = t
+    targets = list(seen_units.values())
+    n_sources = len(ensure_all)
+    title = f"Raise test coverage before structural refactors ({len(targets)} unit(s))"
+    rationale = (
+        f"Batched {n_sources} ensure_tests prep item(s) into one coverage-first gate. "
+        "User opts in or out once at prep phase — not per class."
+    )
+    conf = max(float(c.confidence) for c in ensure_all)
+    metrics = {
+        "estimated_loc_removed": 0,
+        "loc_under_review": sum(
+            int((cs.metrics_delta or {}).get("loc_under_review") or 0) for cs in ensure_all
+        ),
+        "goal": "ensure_tests",
+        "batched_ensure_tests_prep": True,
+        "batched_from": sorted(old_ids),
+        "batched_count": n_sources,
+    }
+    brief = (
+        f"## {title}\n\n"
+        f"Action: `ensure_tests`\nConfidence: {conf:.2f}\n"
+        f"**Prep-only decision** — ask once before queue walk whether to push coverage to the "
+        f"limit on all flagged production code. Do not ask per target.\n\n"
+        f"{rationale}\n\n### Targets\n"
+        + "\n".join(
+            f"- `{t.repo}/{t.path}` :: `{t.symbol}`" for t in targets[:40]
+        )
+        + (f"\n- … and {len(targets) - 40} more" if len(targets) > 40 else "")
+    )
+    unit_key = ",".join(sorted(seen_units.keys()))
+    batched = Changeset(
+        id=content_hash(f"cs:prep:ensure_tests:batch:{unit_key}")[:16],
+        title=title,
+        action="ensure_tests",
+        brief=brief,
+        rationale=rationale,
+        confidence=conf,
+        targets=targets,
+        parallel_group="g-ensure-tests-prep",
+        evidence_refs=evidence,
+        metrics_delta=metrics,
+    )
+
+    def _remap_deps(cs: Changeset) -> Changeset:
+        deps = list(cs.depends_on or [])
+        if not deps:
+            return cs
+        remapped: list[str] = []
+        saw_batched = False
+        for dep in deps:
+            if dep in old_ids:
+                if batched.id not in remapped:
+                    remapped.append(batched.id)
+                saw_batched = True
+            else:
+                remapped.append(dep)
+        if not saw_batched and remapped == deps:
+            return cs
+        return cs.model_copy(update={"depends_on": remapped})
+
+    rest = [c for c in changesets if c.id not in old_ids]
+    rest = [_remap_deps(c) for c in rest]
+    return rest + [batched]
+
+
 def _consolidate_document_followups(changesets: list[Changeset]) -> list[Changeset]:
     """Skip orphaned doc follow-ups; batch overlapping siblings into one opt-in prep item."""
     primary_by_id = {
@@ -1078,10 +1186,13 @@ def attach_quality_followups(
     repos: list[Path] | None = None,
     existing_tests: list[str] | None = None,
     coverage_finding_count: int = 0,
+    describe_mode: str = "describe",
 ) -> list[Changeset]:
     """Emit document/ensure_tests siblings at low confidence; wire split→tests depends_on."""
     if not changesets:
         return changesets
+
+    emit_document = (describe_mode or "describe").strip().lower() == "describe"
 
     if existing_tests is None and repos:
         existing_tests = inventory_test_files(repos)
@@ -1214,7 +1325,12 @@ def attach_quality_followups(
             or bool(ensure_units and cs.action not in {"ensure_tests"})
             or parent_kind in _SLOP_PARENT_KINDS
         )
-        if doc_units and cs.action not in {"document"} and not skip_doc_followup:
+        if (
+            emit_document
+            and doc_units
+            and cs.action not in {"document"}
+            and not skip_doc_followup
+        ):
             followups.append(
                 _make_followup(
                     parent=cs,
@@ -1248,6 +1364,8 @@ def attach_quality_followups(
                 ensure_rationale = (
                     f"{len(ensure_units)} production target(s) need characterization coverage "
                     f"(below {coverage_threshold:.0f}% or draft-map caller branch). "
+                    "Write or expand real tests until Jacoco-relevant behavior is covered — "
+                    "a test file existing is not enough. "
                     "Do not expand Jacoco padding / symbol-exists-only tests."
                 )
             ensure_cs = _make_followup(
@@ -1289,6 +1407,7 @@ def attach_quality_followups(
 
     combined = out + followups
     combined = _collapse_duplicate_followups(combined)
+    combined = _batch_ensure_tests_prep(combined)
     combined = _consolidate_document_followups(combined)
     combined = _wire_structural_wiring_deps(combined)
     cov_first = coverage_first_mode(combined)

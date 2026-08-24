@@ -599,6 +599,46 @@ def test_estimated_empty_index_arms_ensure_tests_for_split_debt(tmp_path: Path) 
     assert coverage_first_mode(out) is True
 
 
+def test_batch_ensure_tests_prep_merges_multiple_items() -> None:
+    from autorefactor.changesets.models import Changeset, ChangesetTarget
+    from autorefactor.plan.followups import _batch_ensure_tests_prep
+
+    a = Changeset(
+        id="et-a",
+        title="Tests for A",
+        action="ensure_tests",
+        brief="a",
+        rationale="r",
+        confidence=0.78,
+        targets=[ChangesetTarget(repo="r", path="A.java", symbol="A")],
+    )
+    b = Changeset(
+        id="et-b",
+        title="Tests for B",
+        action="ensure_tests",
+        brief="b",
+        rationale="r",
+        confidence=0.80,
+        targets=[ChangesetTarget(repo="r", path="B.java", symbol="B")],
+    )
+    split = Changeset(
+        id="split-1",
+        title="Split C",
+        action="split",
+        brief="s",
+        rationale="r",
+        confidence=0.99,
+        depends_on=["et-a"],
+    )
+    out = _batch_ensure_tests_prep([a, b, split])
+    ensure = [c for c in out if c.action == "ensure_tests"]
+    assert len(ensure) == 1
+    assert ensure[0].metrics_delta.get("batched_ensure_tests_prep") is True
+    assert len(ensure[0].targets) == 2
+    remapped = next(c for c in out if c.id == "split-1")
+    assert remapped.depends_on == [ensure[0].id]
+
+
 def test_collapse_primary_ensure_tests_over_followup_sibling() -> None:
     """At most one ensure_tests per unit_id; primary wins over follow-up."""
     from autorefactor.plan.followups import _collapse_duplicate_followups

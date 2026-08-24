@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -89,8 +90,49 @@ def test_sample_queue_splits_auto_and_hitl_without_mutating(
     assert sampled["hitl_burden"]["pending_waiting"] == 0
     assert 0 <= sampled["hitl_burden"]["ratio"] <= 1
     assert "hitl_digest" in sampled["hitl_sample"][0]
+    assert "hitl_review" in sampled["hitl_sample"][0]
     after = [c.status for c in load_queue(out)]
     assert after == before
+
+
+def test_sample_queue_hitl_includes_snippets_when_units_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+    analyze = out / "analyze"
+    analyze.mkdir(parents=True)
+    (analyze / "units.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "u1",
+                    "repo": "r",
+                    "path": "a.py",
+                    "qualified_name": "f",
+                    "kind": "function",
+                    "language": "python",
+                    "source_snippet": "def f(): return 1",
+                    "content_hash": "x",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    save_queue(
+        out,
+        [
+            _cs(cid="hitl1", title="Risky merge", action="split", confidence=0.21),
+        ],
+    )
+    _patch_ws(monkeypatch, ws, out)
+
+    sampled = tool_sample_queue(out=str(out), workspace=str(ws), hitl_limit=1)
+    hitl = sampled["hitl_sample"][0]
+    assert hitl["targets"][0]["source_snippet"] == "def f(): return 1"
+    assert hitl["hitl_review"]["targets"][0]["source_snippet"] == "def f(): return 1"
 
 
 def test_get_status_includes_hitl_burden(

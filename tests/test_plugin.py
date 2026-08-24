@@ -111,14 +111,15 @@ def test_high_confidence_ensure_tests_autoruns(tmp_path: Path) -> None:
     assert nxt.needs_confirmation is False
 
 
-def test_low_confidence_ensure_tests_requires_hitl(tmp_path: Path) -> None:
+def test_low_confidence_ensure_tests_still_autoruns(tmp_path: Path) -> None:
+    """ensure_tests never per-item HITL — prep-phase CTA is the only coverage gate."""
     from autorefactor.changesets.store import ChangesetStore, ensure_tests_padding_hitl
 
     cs = Changeset(
         id="low-prep",
         title="Ensure tests for unknown unit",
         action="ensure_tests",
-        brief="Ask the user before applying (HITL).",
+        brief="Prep-only; no per-item ask.",
         rationale="weak prep",
         confidence=0.40,
     )
@@ -128,8 +129,7 @@ def test_low_confidence_ensure_tests_requires_hitl(tmp_path: Path) -> None:
     store.save([cs])
     nxt = store.next_pending(min_confidence=0.60)
     assert nxt.changeset is not None
-    assert nxt.needs_confirmation is True
-    assert nxt.hitl_reason == "low_confidence"
+    assert nxt.needs_confirmation is False
 
 
 def test_split_at_threshold_auto_proceeds(tmp_path: Path) -> None:

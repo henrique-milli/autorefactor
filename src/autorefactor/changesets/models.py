@@ -36,6 +36,8 @@ class Changeset(BaseModel):
     status: ChangesetStatus = ChangesetStatus.PENDING
     evidence_refs: list[str] = Field(default_factory=list)
     notes: str = ""
+    # UI decide-now / agent-execute-later: proceed | skip | blocked
+    user_decision: str | None = None
 
 
 class NextChangesetResult(BaseModel):

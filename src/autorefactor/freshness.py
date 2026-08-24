@@ -17,6 +17,8 @@ _SKIP_DIR = {
     ".git",
     ".hg",
     ".svn",
+    ".idea",
+    ".vscode",
     "node_modules",
     "target",
     "build",
@@ -24,9 +26,13 @@ _SKIP_DIR = {
     ".venv",
     "venv",
     "__pycache__",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
     ".autorefactor",
-    ".idea",
+    ".autorefactor-data",
     ".gradle",
+    "out",
 }
 
 

@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { fetchChangesets, fetchGraph, fetchMetrics, fetchProjection } from "@/lib/api";
+import { fetchChangesets, fetchGraph, fetchMetrics, fetchProjection, fetchUnits } from "@/lib/api";
 import { VectorMap } from "@/components/map/VectorMap";
 import { Card, CardDesc, CardTitle } from "@/components/ui/card";
 
@@ -15,11 +15,12 @@ export default async function MapPage({
   const { slug } = await params;
   const { cs } = await searchParams;
   try {
-    const [proj, graph, changesets, metrics] = await Promise.all([
+    const [proj, graph, changesets, metrics, units] = await Promise.all([
       fetchProjection(slug),
       fetchGraph(slug),
       fetchChangesets(slug).catch(() => []),
       fetchMetrics(slug).catch(() => null),
+      fetchUnits(slug).catch(() => []),
     ]);
     return (
       <div className="space-y-4">
@@ -35,6 +36,7 @@ export default async function MapPage({
           points={proj.points || []}
           edges={graph.edges || []}
           changesets={changesets}
+          units={units}
           upsideById={Object.fromEntries(
             (metrics?.upside_by_changeset || []).map((row) => [row.id, row]),
           )}

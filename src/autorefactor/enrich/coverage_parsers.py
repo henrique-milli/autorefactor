@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from xml.etree import ElementTree
 
+from autorefactor.coverage_paths import normalize_jacoco_rel_path
 from autorefactor.domain import CoverageFileStat, CoverageSnapshot
 
 
@@ -108,7 +109,7 @@ def parse_jacoco_xml(path: Path) -> CoverageSnapshot:
             percent = (100.0 * covered / total) if total else 0.0
             files.append(
                 CoverageFileStat(
-                    path=rel.replace("\\", "/"),
+                    path=normalize_jacoco_rel_path(rel.replace("\\", "/")),
                     covered_lines=covered,
                     total_lines=total,
                     percent=percent,
@@ -143,6 +144,7 @@ _JACOCO_GLOBS = (
     "build/reports/jacoco/test/jacocoTestReport.xml",
     "**/build/reports/jacoco/test/jacocoTestReport.xml",
     "**/jacoco.xml",
+    "**/jacoco-aggregate/jacoco.xml",
 )
 
 

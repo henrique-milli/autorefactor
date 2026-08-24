@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from autorefactor.domain import Finding, SuggestedAction
+from autorefactor.domain import Finding, SuggestedAction, UnitKind
 
 
 _PAIR_ACTIONS = {
@@ -46,6 +46,24 @@ def validate_findings(
     return kept, rejected
 
 
+def _move_units_incompatible(unit_ids: list[str], units_by_id: dict) -> bool:
+    from autorefactor.sensors.placement import incompatible_placement_move
+
+    units = [units_by_id.get(uid) for uid in unit_ids if uid in units_by_id]
+    units = [u for u in units if u is not None]
+    if len(units) < 2:
+        return False
+    fns = [u for u in units if getattr(u, "kind", None) == UnitKind.FUNCTION]
+    types = [u for u in units if getattr(u, "kind", None) == UnitKind.TYPE]
+    if not fns or not types:
+        return incompatible_placement_move(units[0], units[1])
+    for fn in fns:
+        for t in types:
+            if incompatible_placement_move(fn, t):
+                return True
+    return False
+
+
 def decision_structural_reason(
     decision: dict,
     known_ids: set[str],
@@ -81,6 +99,8 @@ def decision_structural_reason(
             )
         if keys and len(keys) <= 1:
             return "self_merge"
+    if action == SuggestedAction.MOVE and units_by_id and _move_units_incompatible(unit_ids, units_by_id):
+        return "cross_layer_placement"
     if action in _SINGLE_ACTIONS and len(unit_ids) < 1:
         return "empty_targets"
     return None

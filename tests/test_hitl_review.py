@@ -1,0 +1,118 @@
+"""Tests for HITL review payloads with code snippets."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from autorefactor.changesets.models import Changeset, ChangesetStatus, ChangesetTarget
+from autorefactor.mcp import tools as mcp_tools
+from autorefactor.queue import save_queue
+
+_SNIPPET = "def risky_merge():\n    return handler_a() or handler_b()\n"
+
+
+def _write_units(out: Path, *, snippet: str = _SNIPPET) -> None:
+    analyze = out / "analyze"
+    analyze.mkdir(parents=True, exist_ok=True)
+    (analyze / "units.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "u1",
+                    "repo": "r",
+                    "path": "a.py",
+                    "qualified_name": "risky_merge",
+                    "kind": "function",
+                    "language": "python",
+                    "source_snippet": snippet,
+                    "content_hash": "abc123",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _patch_common(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, out: Path) -> None:
+    monkeypatch.setattr(mcp_tools, "resolve_analyze_workspace", lambda _w=None: tmp_path)
+    monkeypatch.setattr(mcp_tools, "resolve_out_dir", lambda _ws, _out=None: out)
+    monkeypatch.setattr(
+        mcp_tools,
+        "load_merged_config",
+        lambda **_k: type("C", (), {"confidence_threshold": 0.6})(),
+    )
+    monkeypatch.setattr(mcp_tools, "_maybe_proxy", lambda *_a, **_k: None)
+    monkeypatch.setattr(mcp_tools, "_queue_fetch_baselines", lambda *_a, **_k: {})
+    monkeypatch.setattr(mcp_tools, "_verify_workspace_root", lambda _ws: tmp_path)
+
+
+def test_get_next_changeset_hitl_review_includes_snippets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    _write_units(out)
+    save_queue(
+        out,
+        [
+            Changeset(
+                id="hitl-doc",
+                title="Risky merge",
+                action="document",
+                brief="Two handlers differ only in exception mapping.",
+                rationale="r",
+                confidence=0.35,
+                targets=[
+                    ChangesetTarget(repo="r", path="a.py", symbol="risky_merge", unit_id="u1")
+                ],
+            ),
+        ],
+    )
+    _patch_common(monkeypatch, tmp_path, out)
+
+    nxt = mcp_tools.tool_get_next_changeset()
+    assert nxt["done"] is False
+    assert nxt["needs_confirmation"] is True
+    assert "hitl_review" in nxt
+    review = nxt["hitl_review"]
+    assert review["title"] == "Risky merge"
+    assert "risky_merge" in review["targets"][0]["source_snippet"]
+    # Prefer model rationale over markdown brief
+    assert "exception mapping" in (review.get("rationale") or "").lower() or review.get("rationale")
+    assert nxt["changeset"]["targets"][0]["source_snippet"]
+    assert "```" in nxt["hitl_digest"]
+    assert "choices" in review
+    assert review["prompt"]
+
+
+def test_get_changeset_enriches_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    _write_units(out)
+    save_queue(
+        out,
+        [
+            Changeset(
+                id="cs1",
+                title="t",
+                action="split",
+                brief="b",
+                rationale="r",
+                confidence=0.5,
+                targets=[
+                    ChangesetTarget(repo="r", path="a.py", symbol="risky_merge", unit_id="u1")
+                ],
+            ),
+        ],
+    )
+    _patch_common(monkeypatch, tmp_path, out)
+
+    detail = mcp_tools.tool_get_changeset("cs1")
+    assert detail["ok"] is True
+    assert detail["changeset"]["targets"][0]["source_snippet"]
+    assert "risky_merge" in detail["changeset"]["targets"][0]["source_snippet"]

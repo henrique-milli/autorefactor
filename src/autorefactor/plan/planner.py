@@ -30,6 +30,22 @@ from autorefactor.sensors.validate import decision_structural_reason
 
 logger = logging.getLogger(__name__)
 
+_KEEP_FALLBACK_KINDS = frozenset(
+    {
+        "committed_secret",
+        "disabled_startup_validation",
+        "draft_in_memory_map",
+        "orphan_kafka",
+        "test_only_handler",
+    }
+)
+_FALLBACK_KEEP_SCORE = 0.6
+_ALWAYS_DISPOSITION_SENSORS = frozenset({"slop", "placement", "sim.fingerprint"})
+_ALWAYS_DISPOSITION_GOALS = frozenset(
+    {AnalysisGoal.SLOP, AnalysisGoal.PLACEMENT, AnalysisGoal.STRUCTURAL_CLONE}
+)
+_SNIPPET_BUDGET = 1600
+_MAX_NEED_CONTEXT = 4
 _ARCHITECTURAL_WIRING_KINDS = frozenset({"orphan_kafka", "test_only_handler"})
 _WIRING_CONFIDENCE_CAP = 0.84
 _WIRING_DECISION_NOTE = (
@@ -37,6 +53,102 @@ _WIRING_DECISION_NOTE = (
     "or remove_dead_wiring (delete orphan handler and PSN config). "
     "Document-only prep cannot resolve this fork."
 )
+
+
+def _fallback_keep_finding(finding: Finding) -> bool:
+    """High-signal findings may stay queued if the planner errors; low-score FPs must not."""
+    kind = str((finding.metadata or {}).get("kind") or "")
+    if kind in _KEEP_FALLBACK_KINDS:
+        return True
+    return float(finding.score or 0) >= _FALLBACK_KEEP_SCORE
+
+
+def _requires_disposition_pass(finding: Finding) -> bool:
+    """Slop / placement / fingerprint must not skip the LLM disposition pass."""
+    if (finding.sensor or "") in _ALWAYS_DISPOSITION_SENSORS:
+        return True
+    return finding.goal in _ALWAYS_DISPOSITION_GOALS
+
+
+def _may_skip_llm_single(finding: Finding) -> bool:
+    if _requires_disposition_pass(finding):
+        return False
+    return _fallback_keep_finding(finding)
+
+
+def _parse_disposition(row: dict) -> str:
+    """Map LLM row → keep|review|trash. Missing disposition defaults to trash."""
+    raw = str(row.get("disposition") or "").strip().lower()
+    if raw in {"keep", "review", "trash"}:
+        return raw
+    if "disposition" not in row and "valid" in row:
+        return "keep" if bool(row.get("valid")) else "trash"
+    return "trash"
+
+
+def _decision_from_finding(
+    finding: Finding,
+    *,
+    units_by_id: dict[str, CodeUnit],
+    findings_by_id: dict[str, Finding],
+    rationale: str,
+    disposition: str,
+) -> PlannerDecision:
+    keep = disposition in {"keep", "review"}
+    return PlannerDecision(
+        title=finding.title if keep else f"Rejected: {finding.title}",
+        action=finding.action_hint,
+        rationale=rationale,
+        confidence=calibrate_confidence(
+            finding_ids=[finding.id],
+            findings_by_id=findings_by_id,
+            llm_confidence=finding.score,
+        )
+        if keep
+        else 0.2,
+        finding_ids=[finding.id],
+        unit_ids=list(finding.unit_ids),
+        disposition=disposition,  # type: ignore[arg-type]
+        valid=keep,
+        estimated_loc_delta=_estimate_loc_delta(
+            finding.action_hint.value, list(finding.unit_ids), units_by_id
+        )
+        if keep
+        else 0,
+        goal=finding.goal,
+    )
+
+
+def _fallback_plan_decisions(
+    findings: list[Finding],
+    units_by_id: dict[str, CodeUnit],
+    findings_by_id: dict[str, Finding],
+    *,
+    rationale: str,
+) -> list[PlannerDecision]:
+    """Keep only high-signal findings when the LLM plan is empty or crashes."""
+    rows: list[PlannerDecision] = []
+    for finding in findings:
+        keep = _fallback_keep_finding(finding) and not _requires_disposition_pass(finding)
+        # Medium-risk sensors: trash on planner failure rather than rubber-stamp.
+        if _requires_disposition_pass(finding):
+            keep = False
+        disposition = "keep" if keep else "trash"
+        rows.append(
+            _apply_architectural_wiring_rules(
+                _decision_from_finding(
+                    finding,
+                    units_by_id=units_by_id,
+                    findings_by_id=findings_by_id,
+                    rationale=rationale
+                    if keep
+                    else f"{rationale} Low-score / medium-risk finding not kept.",
+                    disposition=disposition,
+                ),
+                findings_by_id,
+            )
+        )
+    return rows
 
 
 def _is_architectural_wiring_finding(finding: Finding) -> bool:
@@ -142,36 +254,57 @@ def _estimate_loc_delta(action: str, unit_ids: list[str], units_by_id: dict[str,
     return 0
 
 
-def plan_brief(
-    brief: PlanningBrief,
-    units_by_id: dict[str, CodeUnit],
-    provider: LLMProvider,
-) -> list[PlannerDecision]:
-    findings = brief.findings
-    findings_by_id = {f.id: f for f in findings}
-    if len(findings) == 1:
-        f = findings[0]
-        row = PlannerDecision(
-            title=f.title,
-            action=f.action_hint,
-            rationale=f.evidence,
-            confidence=calibrate_confidence(
-                finding_ids=[f.id],
-                findings_by_id=findings_by_id,
-                llm_confidence=f.score,
-            ),
-            finding_ids=[f.id],
-            unit_ids=list(f.unit_ids),
-            valid=True,
-            estimated_loc_delta=_estimate_loc_delta(
-                f.action_hint.value, list(f.unit_ids), units_by_id
-            ),
-            goal=f.goal,
-        )
-        return [_apply_architectural_wiring_rules(row, findings_by_id)]
+def _planning_system_prompt(brief: PlanningBrief) -> str:
+    return (
+        "You plan refactor changes from a PlanningBrief of overlapping findings. "
+        "Respond with JSON only: "
+        '{"decisions":[{"title":"...","action":"ensure_tests|merge|move|extract_shared|split|'
+        'delete_duplicate|document","disposition":"keep|review|trash","rationale":"...",'
+        '"confidence":0.0,"finding_ids":["..."],"flag_ids":["..."],"unit_ids":["..."]}],'
+        '"need_context":[{"unit_id":"..."}]} . '
+        "disposition is required on every decision: "
+        "keep = clear same-layer win with concrete upside (queue; structural HITL only); "
+        "review = plausible but uncertain / high blast radius / insufficient evidence "
+        "(queue with mandatory human confirmation); "
+        "trash = false positive — discard, do not queue. "
+        "Trash examples: same-file shape twins (validatePam vs validatePsn if-chains), "
+        "mapper→DTO/service placement from embedding cosine alone, divergent-domain "
+        "parallel validators, trivial getters, generated boilerplate. "
+        "Do NOT use low confidence as a substitute for trash — if it is not a real "
+        "refactor, disposition=trash. If unsure between keep and trash, use review. "
+        "Resolve conflicts coherently (merge A↔B OR move A→C, not both). "
+        "Every finding id in the brief MUST appear in at least one decision. "
+        "Reject move when it crosses architectural layers (mapper↔service/DTO/controller, "
+        "or relocating a method onto a type that is only a parameter/return type). "
+        "Optional need_context: up to 4 unit_ids to fetch more snippets (one round only). "
+        "Never emit empty unit_ids. "
+        "When findings show nested_traversal with similarity/clone evidence, prefer "
+        "extract_shared over a bare split. "
+        f"Candidate actions: {[a.value for a in brief.candidate_actions]}. "
+        f"Goals present: {list(brief.findings_by_goal.keys())}."
+    )
 
+
+def _planning_user_payload(
+    brief: PlanningBrief,
+    *,
+    extra_snippets: dict[str, str] | None = None,
+) -> str:
+    unit_lines = []
+    for c in brief.units:
+        sib = ""
+        if c.sibling_methods:
+            sib = f"\n  siblings: {', '.join(c.sibling_methods[:12])}"
+        unit_lines.append(
+            f"- {c.unit_id} {c.kind} {c.repo}/{c.path}::{c.qualified_name}\n"
+            f"  snippet:\n{(c.source_snippet or '')[:_SNIPPET_BUDGET]}{sib}"
+        )
+    if extra_snippets:
+        unit_lines.append("Additional requested context:")
+        for uid, snip in extra_snippets.items():
+            unit_lines.append(f"- {uid}\n  snippet:\n{(snip or '')[:_SNIPPET_BUDGET]}")
     flag_lines = []
-    for f in findings:
+    for f in brief.findings:
         unit_bits = [
             f"{c.unit_id}|{c.kind}|{c.repo}/{c.path}::{c.qualified_name}|{c.description}"
             for c in brief.units
@@ -183,66 +316,21 @@ def plan_brief(
             f"evidence={f.evidence} hints={','.join(f.hints) or 'none'} "
             f"units={', '.join(unit_bits)}"
         )
-    system = (
-        "You plan refactor changes from a PlanningBrief of overlapping findings. "
-        "Respond with JSON only: "
-        '{"decisions":[{"title":"...","action":"ensure_tests|merge|move|extract_shared|split|'
-        'delete_duplicate|document","rationale":"...","confidence":0.0,'
-        '"finding_ids":["..."],"flag_ids":["..."],"unit_ids":["..."],"valid":true}]}. '
-        "Resolve conflicts coherently (merge A↔B OR move A→C, not both). "
-        "Every finding id in the brief MUST appear in at least one decision "
-        "(dedicated per-finding decisions are fine when they do not conflict). "
-        "All actions are allowed including move. Use hints as soft guidance only. "
-        "Reject only when evidence is insufficient. Never emit empty unit_ids. "
-        "When findings show nested_traversal (or nested loops) together with similarity/"
-        "clone evidence, prefer extract_shared over a bare split. "
-        f"Candidate actions: {[a.value for a in brief.candidate_actions]}. "
-        f"Goals present: {list(brief.findings_by_goal.keys())}."
-    )
-    user = (
+    return (
         f"Component {brief.component_id}\nUnits:\n"
-        + "\n".join(f"- {c.unit_id} {c.kind} {c.repo}/{c.path}::{c.qualified_name}" for c in brief.units)
+        + "\n".join(unit_lines)
         + "\nFindings:\n"
         + "\n".join(flag_lines)
     )
-    try:
-        parsed = provider.chat_json(system, user)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("plan failed: %s", exc)
-        return [
-            PlannerDecision(
-                title=f"Unresolved: {findings[0].title}",
-                action=findings[0].action_hint,
-                rationale=f"Planner error: {exc}",
-                confidence=0.2,
-                finding_ids=[f.id for f in findings],
-                unit_ids=sorted({uid for f in findings for uid in f.unit_ids}),
-                valid=False,
-                goal=findings[0].goal,
-            )
-        ]
-    decisions = parsed.get("decisions")
-    if not isinstance(decisions, list) or not decisions:
-        best = max(findings, key=lambda x: x.score)
-        return [
-            PlannerDecision(
-                title=best.title,
-                action=best.action_hint,
-                rationale="Fallback: highest-score finding after empty plan.",
-                confidence=calibrate_confidence(
-                    finding_ids=[best.id],
-                    findings_by_id=findings_by_id,
-                    llm_confidence=best.score,
-                ),
-                finding_ids=[best.id],
-                unit_ids=list(best.unit_ids),
-                valid=True,
-                estimated_loc_delta=_estimate_loc_delta(
-                    best.action_hint.value, list(best.unit_ids), units_by_id
-                ),
-                goal=best.goal,
-            )
-        ]
+
+
+def _rows_to_decisions(
+    decisions: list,
+    *,
+    findings: list[Finding],
+    findings_by_id: dict[str, Finding],
+    units_by_id: dict[str, CodeUnit],
+) -> list[PlannerDecision]:
     out: list[PlannerDecision] = []
     for row in decisions:
         if not isinstance(row, dict):
@@ -253,16 +341,20 @@ def plan_brief(
             selected = [f for f in findings if not finding_ids or f.id in finding_ids] or findings
             unit_ids = sorted({uid for f in selected for uid in f.unit_ids})
         action = _decision_to_action(str(row.get("action") or "document"))
+        disposition = _parse_disposition(row)
         conf = calibrate_confidence(
             finding_ids=finding_ids,
             findings_by_id=findings_by_id,
             llm_confidence=float(row.get("confidence") or 0.5),
         )
+        if disposition == "trash":
+            conf = min(conf, 0.2)
         goal = None
         for fid in finding_ids:
             if fid in findings_by_id:
                 goal = findings_by_id[fid].goal
                 break
+        keep = disposition != "trash"
         out.append(
             _apply_architectural_wiring_rules(
                 PlannerDecision(
@@ -272,54 +364,131 @@ def plan_brief(
                     confidence=conf,
                     finding_ids=finding_ids,
                     unit_ids=unit_ids,
-                    valid=bool(row.get("valid", True)),
-                    estimated_loc_delta=_estimate_loc_delta(action.value, unit_ids, units_by_id),
+                    disposition=disposition,  # type: ignore[arg-type]
+                    valid=keep,
+                    estimated_loc_delta=_estimate_loc_delta(action.value, unit_ids, units_by_id)
+                    if keep
+                    else 0,
                     goal=goal,
                 ),
                 findings_by_id,
             )
         )
-    # Cover findings the model omitted so giant/partial plans do not silently drop work
     covered = {fid for d in out for fid in d.finding_ids}
     for finding in findings:
         if finding.id in covered:
             continue
-        # Prefer attaching to an existing valid decision that already targets these units
-        attached = False
-        for idx, decision in enumerate(out):
-            if not decision.valid:
-                continue
-            if set(finding.unit_ids) and set(finding.unit_ids).issubset(set(decision.unit_ids)):
-                merged_ids = list(dict.fromkeys([*decision.finding_ids, finding.id]))
-                out[idx] = decision.model_copy(update={"finding_ids": merged_ids})
-                covered.add(finding.id)
-                attached = True
-                break
-        if attached:
-            continue
+        # Omitted findings: trash unless high-signal non-medium-risk.
+        keep = _fallback_keep_finding(finding) and not _requires_disposition_pass(finding)
         out.append(
             _apply_architectural_wiring_rules(
-                PlannerDecision(
-                    title=finding.title,
-                    action=finding.action_hint,
-                    rationale="Fallback: finding not selected in LLM plan; using sensor action_hint.",
-                    confidence=calibrate_confidence(
-                        finding_ids=[finding.id],
-                        findings_by_id=findings_by_id,
-                        llm_confidence=finding.score,
+                _decision_from_finding(
+                    finding,
+                    units_by_id=units_by_id,
+                    findings_by_id=findings_by_id,
+                    rationale=(
+                        "Fallback: high-signal finding omitted from LLM plan."
+                        if keep
+                        else "Rejected: omitted from LLM plan (not force-kept)."
                     ),
-                    finding_ids=[finding.id],
-                    unit_ids=list(finding.unit_ids),
-                    valid=True,
-                    estimated_loc_delta=_estimate_loc_delta(
-                        finding.action_hint.value, list(finding.unit_ids), units_by_id
-                    ),
-                    goal=finding.goal,
+                    disposition="keep" if keep else "trash",
                 ),
                 findings_by_id,
             )
         )
     return out
+
+
+def _extract_need_context(parsed: dict, units_by_id: dict[str, CodeUnit]) -> dict[str, str]:
+    raw = parsed.get("need_context") or []
+    if not isinstance(raw, list):
+        return {}
+    out: dict[str, str] = {}
+    for item in raw:
+        uid = ""
+        if isinstance(item, dict):
+            uid = str(item.get("unit_id") or item.get("id") or "")
+        elif isinstance(item, str):
+            uid = item
+        if not uid or uid in out or uid not in units_by_id:
+            continue
+        out[uid] = (units_by_id[uid].source_snippet or "")[:_SNIPPET_BUDGET]
+        if len(out) >= _MAX_NEED_CONTEXT:
+            break
+    return out
+
+
+def plan_brief(
+    brief: PlanningBrief,
+    units_by_id: dict[str, CodeUnit],
+    provider: LLMProvider,
+) -> list[PlannerDecision]:
+    findings = brief.findings
+    findings_by_id = {f.id: f for f in findings}
+    if len(findings) == 1 and _may_skip_llm_single(findings[0]):
+        f = findings[0]
+        row = _decision_from_finding(
+            f,
+            units_by_id=units_by_id,
+            findings_by_id=findings_by_id,
+            rationale=f.evidence,
+            disposition="keep",
+        )
+        return [_apply_architectural_wiring_rules(row, findings_by_id)]
+
+    system = _planning_system_prompt(brief)
+    user = _planning_user_payload(brief)
+    try:
+        parsed = provider.chat_json(system, user)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("plan failed: %s", exc)
+        return _fallback_plan_decisions(
+            findings,
+            units_by_id,
+            findings_by_id,
+            rationale=f"Planner error: {exc}",
+        )
+    if not isinstance(parsed, dict):
+        return _fallback_plan_decisions(
+            findings,
+            units_by_id,
+            findings_by_id,
+            rationale="Fallback: empty plan.",
+        )
+
+    # One bounded retrieval round when the model asks for more unit snippets.
+    extra = _extract_need_context(parsed, units_by_id)
+    if extra:
+        try:
+            parsed = provider.chat_json(
+                system + " Final pass: emit dispositions only; need_context must be empty.",
+                _planning_user_payload(brief, extra_snippets=extra),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("plan context pass failed: %s", exc)
+            # Keep first-pass parse if second fails.
+        if not isinstance(parsed, dict):
+            return _fallback_plan_decisions(
+                findings,
+                units_by_id,
+                findings_by_id,
+                rationale="Fallback: empty plan after context pass.",
+            )
+
+    decisions = parsed.get("decisions")
+    if not isinstance(decisions, list) or not decisions:
+        return _fallback_plan_decisions(
+            findings,
+            units_by_id,
+            findings_by_id,
+            rationale="Fallback: empty plan.",
+        )
+    return _rows_to_decisions(
+        decisions,
+        findings=findings,
+        findings_by_id=findings_by_id,
+        units_by_id=units_by_id,
+    )
 
 
 def _is_root_unit(unit: CodeUnit | None) -> bool:
@@ -455,6 +624,9 @@ def decisions_to_changesets(
             "target_locs": locs,
             "goal": goal,
             "cross_repo": len({t.repo for t in targets}) >= 2,
+            "plan_disposition": getattr(decision, "disposition", None) or (
+                "keep" if decision.valid else "trash"
+            ),
         }
         for fid in decision.finding_ids or []:
             finding = findings_by_id.get(fid)
@@ -546,27 +718,18 @@ def plan_findings(
                     logger.warning("component plan crashed: %s", exc)
                     part = []
                 if not part:
-                    # Never leave a whole component uncovered
-                    part = [
-                        PlannerDecision(
-                            title=f.title,
-                            action=f.action_hint,
-                            rationale="Fallback: empty/crashed component plan.",
-                            confidence=calibrate_confidence(
-                                finding_ids=[f.id],
+                    part = []
+                    for f in comp:
+                        keep = _fallback_keep_finding(f) and not _requires_disposition_pass(f)
+                        part.append(
+                            _decision_from_finding(
+                                f,
+                                units_by_id=units_by_id,
                                 findings_by_id={x.id: x for x in comp},
-                                llm_confidence=f.score,
-                            ),
-                            finding_ids=[f.id],
-                            unit_ids=list(f.unit_ids),
-                            valid=True,
-                            estimated_loc_delta=_estimate_loc_delta(
-                                f.action_hint.value, list(f.unit_ids), units_by_id
-                            ),
-                            goal=f.goal,
+                                rationale="Fallback: empty/crashed component plan.",
+                                disposition="keep" if keep else "trash",
+                            )
                         )
-                        for f in comp
-                    ]
                 known = set(units_by_id)
                 comp_by_id = {x.id: x for x in comp}
                 cleaned: list[PlannerDecision] = []
@@ -583,6 +746,7 @@ def plan_findings(
                         row = row.model_copy(
                             update={
                                 "valid": False,
+                                "disposition": "trash",
                                 "rationale": f"{row.rationale} [structural:{reason}]",
                             }
                         )
@@ -600,6 +764,7 @@ def plan_findings(
                             valid=row.valid,
                             reasoning=row.rationale,
                             refined_action=row.action if row.valid else None,
+                            disposition=row.disposition,
                         )
                         prev = seen_in_comp.get(fid)
                         # Prefer a valid selection if the model emitted duplicates
@@ -616,6 +781,7 @@ def plan_findings(
                     finding=finding,
                     valid=False,
                     reasoning="Dropped during plan (not selected).",
+                    disposition="trash",
                 )
             )
 

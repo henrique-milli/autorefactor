@@ -12,6 +12,10 @@ TOKENS_PER_LOC = 4
 
 
 def upside_kind(cs: Changeset) -> str:
+    kind = str((cs.metrics_delta or {}).get("kind") or "").lower()
+    # Slop / behavioral findings are not "dedup clone pairs" even when action is extract_shared.
+    if kind in {"draft_in_memory_map", "disabled_startup_validation", "committed_secret"}:
+        return "slop"
     if cs.action in _DEDUP_ACTIONS:
         return "dedup"
     if cs.action == "ensure_tests":
@@ -19,6 +23,17 @@ def upside_kind(cs: Changeset) -> str:
     if cs.action == "document":
         return "docs"
     return "structure"
+
+
+def changeset_why(cs: Changeset, *, max_chars: int = 280) -> str:
+    """One-sentence model rationale for humans (prefer rationale over plan brief)."""
+    raw = " ".join(((cs.rationale or "").strip() or (cs.brief or "").strip()).split())
+    if not raw:
+        return ""
+    if len(raw) <= max_chars:
+        return raw
+    cut = raw[: max_chars - 1].rsplit(" ", 1)[0]
+    return (cut or raw[: max_chars - 1]) + "…"
 
 
 def attempt_retries_avoided(cs: Changeset) -> float:
@@ -112,9 +127,21 @@ def per_task_agent_gains(
 def plain_english_upside(cs: Changeset) -> str:
     rem = int(cs.metrics_delta.get("estimated_loc_removed") or 0)
     rev = int(cs.metrics_delta.get("loc_under_review") or 0)
+    finding_kind = str((cs.metrics_delta or {}).get("kind") or "").lower()
+    if finding_kind == "draft_in_memory_map":
+        return (
+            "Replace draft HashMap defaults with config/repo-backed mapping "
+            "so unmapped assets fail clearly instead of silently skipping."
+        )
+    if finding_kind == "disabled_startup_validation":
+        return "Re-enable or replace disabled startup validation so bad config fails fast."
+    if finding_kind == "committed_secret":
+        return "Remove committed secrets and externalize credentials via env/vault."
     kind = upside_kind(cs)
-    if kind == "dedup" and rem > 0:
+    if kind == "dedup" and rem > 0 and len(cs.targets or []) >= 2:
         return f"Share/delete ~{rem} LOC of duplicated logic (less fork surface for agents)."
+    if kind == "dedup" and rem > 0:
+        return f"Extract ~{rem} LOC into one shared place (single-unit share, not a clone pair)."
     if kind == "dedup":
         return "Consolidate near-duplicate behavior so agents edit one place."
     if kind == "safety":

@@ -124,12 +124,35 @@ def build_planning_brief(
     *,
     component_id: str,
 ) -> PlanningBrief:
+    from autorefactor.domain import UnitKind
+    from autorefactor.index.hierarchy import simple_name
+
     unit_ids = sorted({uid for f in component for uid in f.unit_ids})
+    # Sibling methods on the same TYPE help the planner reject same-file shape twins.
+    siblings_by_parent: dict[str, list[str]] = defaultdict(list)
+    for u in units_by_id.values():
+        if u.kind != UnitKind.FUNCTION or "." not in (u.qualified_name or ""):
+            continue
+        parent = u.qualified_name.rsplit(".", 1)[0]
+        siblings_by_parent[f"{u.repo}|{parent}"].append(simple_name(u.qualified_name))
+
     cards: list[UnitCard] = []
     for uid in unit_ids:
         u = units_by_id.get(uid)
         if not u:
             continue
+        parent_key = ""
+        if u.kind == UnitKind.FUNCTION and "." in (u.qualified_name or ""):
+            parent_key = f"{u.repo}|{u.qualified_name.rsplit('.', 1)[0]}"
+        elif u.kind == UnitKind.TYPE:
+            parent_key = f"{u.repo}|{u.qualified_name}"
+        sibs = sorted(
+            {
+                s
+                for s in siblings_by_parent.get(parent_key, [])
+                if s != simple_name(u.qualified_name)
+            }
+        )[:12]
         cards.append(
             UnitCard(
                 unit_id=u.id,
@@ -138,6 +161,8 @@ def build_planning_brief(
                 path=u.path,
                 qualified_name=u.qualified_name,
                 description=(u.description or u.source_snippet[:80]).replace("\n", " ")[:120],
+                source_snippet=(u.source_snippet or "")[:1600],
+                sibling_methods=sibs,
             )
         )
     by_goal: dict[str, list[str]] = defaultdict(list)

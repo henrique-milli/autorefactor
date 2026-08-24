@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import numpy as np
 
@@ -16,6 +17,107 @@ from autorefactor.domain import (
 from autorefactor.index.hierarchy import simple_name
 from autorefactor.sensors.base import AnalysisContext
 from autorefactor.sensors.similarity import _is_low_signal, cosine, is_test_path
+
+# Roles that must not be mixed by embedding-only placement moves.
+_DTO_SUFFIXES = (
+    "data",
+    "dto",
+    "request",
+    "response",
+    "entity",
+    "model",
+    "vo",
+    "pojo",
+    "record",
+)
+_ROLE_PACKAGE = (
+    ("mapper", ("/mapper/", "/mappers/")),
+    ("controller", ("/controller/", "/controllers/", "/resource/", "/resources/", "/endpoint/")),
+    ("repository", ("/repository/", "/repositories/", "/dao/", "/persistence/")),
+    ("service", ("/service/", "/services/")),
+    ("dto", ("/dto/", "/dtos/", "/model/", "/models/", "/domain/value/")),
+)
+
+
+def architectural_role(path: str, qualified_name: str) -> str | None:
+    """Coarse layer role from path / type name (Java-ish layouts)."""
+    p = (path or "").replace("\\", "/").lower()
+    qn = (qualified_name or "").strip()
+    simple = qn.rsplit(".", 1)[-1] if qn else Path(p).stem
+    simple_l = simple.lower()
+    # Nested *Data / *Response / *Entity wins over the outer service file path.
+    if simple_l.endswith(_DTO_SUFFIXES) and not simple_l.endswith(
+        ("service", "mapper", "controller", "repository", "handler")
+    ):
+        return "dto"
+    if simple_l.endswith("mapper") or "/mapper/" in p or "/mappers/" in p:
+        return "mapper"
+    stem = Path(p).stem.lower()
+    if "mapper" in stem:
+        return "mapper"
+    for role, markers in _ROLE_PACKAGE:
+        if any(m in p for m in markers):
+            return role
+    if simple_l.endswith("service") or simple_l.endswith("services"):
+        return "service"
+    if simple_l.endswith(("controller", "resource", "endpoint")):
+        return "controller"
+    if simple_l.endswith(("repository", "dao")):
+        return "repository"
+    return None
+
+
+def role_for_unit(unit) -> str | None:
+    """Role for a function (owner type) or type unit."""
+    path = getattr(unit, "path", "") or ""
+    qn = getattr(unit, "qualified_name", "") or ""
+    kind = getattr(unit, "kind", None)
+    if kind == UnitKind.FUNCTION and "." in qn:
+        return architectural_role(path, qn.rsplit(".", 1)[0])
+    return architectural_role(path, qn)
+
+
+def cross_layer_placement(fn, target) -> bool:
+    """True when moving ``fn`` onto ``target`` crosses incompatible layers."""
+    src = role_for_unit(fn)
+    dst = role_for_unit(target)
+    if src is None or dst is None:
+        return False
+    if src == dst:
+        return False
+    # Mapper methods belong in mappers; DTOs are not homes for mapper logic.
+    if "mapper" in {src, dst}:
+        return True
+    if dst == "dto" and src in {"service", "controller", "repository"}:
+        return True
+    return False
+
+
+def _target_named_in_signature(fn, target) -> bool:
+    """True when the target type name appears in the method signature (param affinity)."""
+    snippet = (getattr(fn, "source_snippet", None) or "").strip()
+    if not snippet:
+        return False
+    # Signature ≈ text before first '{' or first line for abstract methods.
+    head = snippet.split("{", 1)[0]
+    if "\n" in head:
+        head = "\n".join(head.splitlines()[:8])
+    target_name = simple_name(getattr(target, "qualified_name", "") or "")
+    if not target_name or len(target_name) < 3:
+        return False
+    return bool(re.search(rf"\b{re.escape(target_name)}\b", head))
+
+
+def incompatible_placement_move(fn, target) -> bool:
+    """Reject embedding placement FPs: cross-layer or param-type affinity into DTO/mapper."""
+    if cross_layer_placement(fn, target):
+        return True
+    dst = role_for_unit(target)
+    if dst in {"dto", "mapper"} and _target_named_in_signature(fn, target):
+        # Method that takes AggregatedBonusData embedding-matches the DTO —
+        # that is expected coupling, not a reason to relocate the method onto it.
+        return True
+    return False
 
 
 def _is_interface_or_abstract_type(unit) -> bool:
@@ -194,6 +296,9 @@ class PlacementSensor:
                 type_methods=type_methods,
                 interface_by_qn=interface_by_qn,
             ):
+                continue
+
+            if incompatible_placement_move(fn, best):
                 continue
 
             f = try_make_finding(

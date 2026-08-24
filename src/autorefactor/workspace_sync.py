@@ -288,6 +288,23 @@ def _walk_files(root: Path) -> list[str]:
 
 
 FORCE_WALK_MARKER = ".ar_eval_force_walk"
+_COVERAGE_REPORT_NAMES = frozenset({"jacoco.xml", "jacocotestreport.xml"})
+
+
+def _coverage_report_relpaths(root: Path) -> list[str]:
+    """Jacoco XML under target/build even when those dirs are otherwise skipped."""
+    out: list[str] = []
+    for pattern in ("**/jacoco.xml", "**/jacocoTestReport.xml"):
+        for path in root.glob(pattern):
+            if not path.is_file():
+                continue
+            try:
+                rel = str(path.relative_to(root)).replace("\\", "/")
+            except ValueError:
+                continue
+            if path.name.lower() in _COVERAGE_REPORT_NAMES:
+                out.append(rel)
+    return out
 
 
 def list_workspace_files(root: Path) -> list[str]:
@@ -296,6 +313,7 @@ def list_workspace_files(root: Path) -> list[str]:
     files = None if force_walk else _git_files(root)
     if files is None:
         files = _walk_files(root)
+    files = list(files) + _coverage_report_relpaths(root)
     # Drop sync meta if present
     return sorted(
         {

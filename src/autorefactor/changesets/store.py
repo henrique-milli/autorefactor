@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 from autorefactor.changesets.models import Changeset, ChangesetStatus, NextChangesetResult
 from autorefactor.changesets.ranking import coverage_first_mode, prep_rank
@@ -337,9 +338,17 @@ def changeset_needs_hitl(
 
     Unsatisfied deps are waiting (``blocked_deps``), not a user confirmation.
     High-confidence items auto-proceed unless a real judgment kind applies.
+    UI-approved items (``user_decision=proceed``) skip HITL.
     """
     if not deps_satisfied:
         return False, "blocked_deps"
+    decision = (changeset.user_decision or "").strip().lower()
+    if decision == "proceed":
+        return False, None
+    action = (changeset.action or "").strip().lower()
+    # Coverage prep is gated once at the prep-phase CTA — never per-item HITL.
+    if action == "ensure_tests":
+        return False, None
     if security_sensitive_hitl(changeset):
         return True, "security_sensitive"
     if slop_kind_hitl(changeset):
@@ -354,16 +363,101 @@ def changeset_needs_hitl(
         return True, "framework_sensitive_split"
     if placement_risk_move(changeset):
         return True, "placement_risk"
+    plan_disp = str((changeset.metrics_delta or {}).get("plan_disposition") or "").strip().lower()
+    if plan_disp == "review":
+        return True, "plan_review"
+    # Planner keep: do not re-open as low_confidence FP dumpster.
+    if plan_disp == "keep":
+        if _threshold_band_hitl(changeset, min_confidence):
+            return True, "threshold_band"
+        if _behavior_sensitive_band_hitl(changeset, min_confidence):
+            return True, "behavior_sensitive_dedup"
+        if action in _HITL_AT_THRESHOLD_ACTIONS and changeset.confidence == min_confidence:
+            return True, "low_confidence"
+        return False, None
     if _low_confidence_hitl(changeset, min_confidence):
         return True, "low_confidence"
     if _threshold_band_hitl(changeset, min_confidence):
         return True, "threshold_band"
     if _behavior_sensitive_band_hitl(changeset, min_confidence):
         return True, "behavior_sensitive_dedup"
-    action = (changeset.action or "").strip().lower()
     if action in _HITL_AT_THRESHOLD_ACTIONS and changeset.confidence == min_confidence:
         return True, "low_confidence"
     return False, None
+
+
+_VALID_USER_DECISIONS = frozenset({"proceed", "skip", "blocked"})
+
+
+def set_user_decision(
+    out_dir: Path,
+    changeset_id: str,
+    decision: str | None,
+) -> Changeset:
+    """Persist a UI review decision (decide now, agent executes later).
+
+    ``proceed`` — keep pending, agent auto_proceeds.
+    ``skip`` / ``blocked`` — mark status accordingly.
+    ``None`` — undo approve (clear decision; restore pending if was skipped/blocked by UI).
+    """
+    from autorefactor.queue import load_queue, save_queue
+
+    items = load_queue(out_dir)
+    found: Changeset | None = None
+    idx = -1
+    for i, item in enumerate(items):
+        if item.id == changeset_id:
+            found = item
+            idx = i
+            break
+    if found is None:
+        raise KeyError(f"changeset not found: {changeset_id}")
+
+    if decision is None or decision == "":
+        updates: dict[str, Any] = {"user_decision": None}
+        # Undo: if UI skip/blocked left a terminal status, reopen for review.
+        if found.user_decision in {"skip", "blocked"} and found.status in {
+            ChangesetStatus.SKIPPED,
+            ChangesetStatus.BLOCKED,
+        }:
+            updates["status"] = ChangesetStatus.PENDING
+            if (found.notes or "").startswith("UI review:"):
+                updates["notes"] = ""
+        updated = found.model_copy(update=updates)
+    else:
+        norm = str(decision).strip().lower()
+        if norm not in _VALID_USER_DECISIONS:
+            raise ValueError(f"invalid decision: {decision}")
+        if norm == "proceed":
+            updated = found.model_copy(
+                update={
+                    "user_decision": "proceed",
+                    "status": ChangesetStatus.PENDING
+                    if found.status
+                    in {ChangesetStatus.SKIPPED, ChangesetStatus.BLOCKED}
+                    else found.status,
+                    "notes": "UI review: approved — agent should apply when executing queue",
+                }
+            )
+        elif norm == "skip":
+            updated = found.model_copy(
+                update={
+                    "user_decision": "skip",
+                    "status": ChangesetStatus.SKIPPED,
+                    "notes": "UI review: skipped",
+                }
+            )
+        else:
+            updated = found.model_copy(
+                update={
+                    "user_decision": "blocked",
+                    "status": ChangesetStatus.BLOCKED,
+                    "notes": "UI review: blocked",
+                }
+            )
+    items[idx] = updated
+    save_queue(out_dir, items)
+    return updated
 
 
 def hitl_questions_for_reason(
@@ -382,9 +476,8 @@ def hitl_questions_for_reason(
         ]
     if reason == "ensure_tests":
         return [
-            "Low-confidence ensure_tests prep — confirm before scaffolding tests.",
-            f"Proceed with '{changeset.title}' ({changeset.action})?",
-            "Reply yes to continue, skip to skip, or provide guidance.",
+            "ensure_tests prep is decided once at the prep-phase coverage CTA (yes/no).",
+            "Do not ask proceed/skip/blocked on individual ensure_tests items.",
         ]
     if reason == "security_sensitive":
         return [
@@ -443,6 +536,12 @@ def hitl_questions_for_reason(
             f"Proceed with '{changeset.title}' ({changeset.action})?",
             "Reply yes to continue, skip to skip, or provide guidance.",
         ]
+    if reason == "plan_review":
+        return [
+            "Planner marked this for human review (uncertain keep vs trash / high blast radius).",
+            f"Proceed with '{changeset.title}' ({changeset.action})?",
+            "Reply yes to continue, skip to skip, or blocked.",
+        ]
     if reason == "framework_sensitive_split":
         return [
             "MapStruct @Mapper/@Mapping interface split — partial helper extraction can break "
@@ -482,7 +581,10 @@ class ChangesetStore:
         if not self.path.exists():
             return []
         raw = json.loads(self.path.read_text(encoding="utf-8"))
-        items = raw.get("changesets", raw if isinstance(raw, list) else [])
+        if isinstance(raw, list):
+            items = raw
+        else:
+            items = raw.get("changesets", [])
         return [Changeset.model_validate(item) for item in items]
 
     def save(self, changesets: list[Changeset]) -> None:
@@ -517,8 +619,10 @@ class ChangesetStore:
     def _sort_pending_key(self, c: Changeset) -> tuple:
         items = self.load()
         cov_first = coverage_first_mode(items)
+        ui_approved = 1 if (c.user_decision or "").strip().lower() == "proceed" else 0
         return (
             -(1 if c.status == ChangesetStatus.IN_PROGRESS else 0),
+            -ui_approved,  # UI-approved items drain before unreviewed HITL
             prep_rank(c, coverage_first=cov_first),
             -int(bool(c.metrics_delta.get("cross_repo"))),
             -c.confidence,
@@ -537,6 +641,19 @@ class ChangesetStore:
         ]
         if not pending:
             return NextChangesetResult(done=True)
+        # While any UI-approved proceed items remain, execute only those (+ in_progress).
+        ui_approved = [
+            c
+            for c in pending
+            if (c.user_decision or "").strip().lower() == "proceed"
+        ]
+        if ui_approved:
+            pending = [
+                c
+                for c in pending
+                if (c.user_decision or "").strip().lower() == "proceed"
+                or c.status == ChangesetStatus.IN_PROGRESS
+            ]
         # Only DONE dependencies unblock dependents (SKIPPED/BLOCKED do not).
         ids_done = {
             c.id for c in self.load() if c.status == ChangesetStatus.DONE

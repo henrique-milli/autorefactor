@@ -17,6 +17,7 @@ from autorefactor.config_store import (
 from autorefactor.describe import describe_units
 from autorefactor.index.store import IndexStore
 from autorefactor.paths import load_run_identity, resolve_out_dir
+from autorefactor.snippets import enrich_targets, snippet_blocks_for_digest
 from autorefactor.stages.analyze import build_provider, run_analyze
 from autorefactor.workspace_sync import (
     clone_git_workspace,
@@ -79,25 +80,41 @@ def tool_workspace_status() -> dict[str, Any]:
     return workspace_status()
 
 
-def tool_sync_workspace() -> dict[str, Any]:
-    """Force-upload the open project to the remote active workspace."""
-    from autorefactor.mcp.remote import ensure_remote_workspace, remote_enabled
+def tool_sync_workspace(path: str | None = None) -> dict[str, Any]:
+    """Upload a local project tree to the remote active workspace (tar.gz over HTTP)."""
+    from autorefactor.mcp.remote import (
+        SyncRootError,
+        ensure_remote_workspace,
+        remote_enabled,
+    )
 
     if remote_enabled():
         try:
-            result = ensure_remote_workspace(force=True)
+            result = ensure_remote_workspace(path=path, force=True)
             result.setdefault("ok", True)
-            result["synced"] = True
-            result["next_step"] = "Call analyze (workspace is set automatically)."
+            result["synced"] = not result.get("skipped")
+            result["next_step"] = (
+                "Call analyze(path=<same>, background=true) or analyze() after this sync."
+            )
             return result
+        except SyncRootError as exc:
+            return {
+                "ok": False,
+                "error": "sync_path_required",
+                "detail": str(exc),
+                "next_step": (
+                    "Pass path='/absolute/path/to/project' or set AUTOREFACTOR_MCP_WORKSPACE. "
+                    "CLI equivalent: autorefactor sync -w /path/to/project"
+                ),
+            }
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": "sync_failed", "detail": str(exc)[:500]}
     return {
         "ok": False,
         "error": "sync_unavailable",
         "detail": (
-            "sync_workspace requires local stdio MCP with AUTOREFACTOR_REMOTE_URL "
-            "(Cursor should run autorefactor-mcp as a command, not a bare Docker /mcp URL)."
+            "sync_workspace requires stdio MCP with AUTOREFACTOR_REMOTE_URL, "
+            "or use CLI: autorefactor sync -w /path/to/project"
         ),
     }
 
@@ -262,7 +279,8 @@ def tool_analyze(
     skip_llm: bool = False,
     describe_mode: str | None = None,
     focus: str | None = None,
-    background: bool = False,
+    background: bool = True,
+    path: str | None = None,
 ) -> dict[str, Any]:
     proxied = _maybe_proxy(
         "analyze",
@@ -273,6 +291,7 @@ def tool_analyze(
             "describe_mode": describe_mode,
             "focus": focus,
             "background": background,
+            "path": path,
         },
     )
     if proxied is not None:
@@ -462,12 +481,31 @@ def tool_get_status(workspace: str | None = None, out: str | None = None) -> dic
     ws = info["path"]
     out_dir = resolve_out_dir(ws, Path(out) if out else None)
     config = load_merged_config(workspace=ws, out_dir=out_dir)
-    fresh, items, by_status, fingerprint_stale = _freshness_queue_snapshot(ws, out_dir)
     report_md = out_dir / "report" / "report.md"
     lock_key = str(out_dir.resolve())
     active = active_job_id(lock_key)
     from autorefactor.enrich_queue import pending_enrich_count
     from autorefactor.enrich_queue.store import EnrichTaskStore, enrich_queue_path
+    from autorefactor.queue import load_queue
+
+    if active:
+        # Full workspace fingerprint scans block HTTP/MCP for minutes on large repos
+        # while analyze already holds the GIL — skip until the job finishes.
+        items = load_queue(out_dir)
+        by_status = _status_counts(items)
+        fingerprint_stale = _queue_fingerprint_stale_count(items)
+        fresh = {
+            "fresh": False,
+            "apply_safe": False,
+            "freshness": {
+                "reason": "analyze_in_progress",
+                "run_fingerprint": None,
+                "current_fingerprint": None,
+                "apply_safe": False,
+            },
+        }
+    else:
+        fresh, items, by_status, fingerprint_stale = _freshness_queue_snapshot(ws, out_dir)
 
     enrich_items = EnrichTaskStore(enrich_queue_path(out_dir)).load()
     enrich_by: dict[str, int] = {}
@@ -542,6 +580,36 @@ def _stale_report_banner(fresh: dict[str, Any]) -> str:
     )
 
 
+def _prep_coverage_cta(out_dir: Path) -> dict[str, Any] | None:
+    """Single prep-phase coverage question — not per ensure_tests item."""
+    from autorefactor.changesets import ChangesetStatus
+    from autorefactor.queue import load_queue
+
+    items = load_queue(out_dir)
+    ensure = [
+        c
+        for c in items
+        if (c.action or "").strip().lower() == "ensure_tests"
+        and c.status in {ChangesetStatus.PENDING, ChangesetStatus.IN_PROGRESS}
+    ]
+    if not ensure:
+        return None
+    targets = sum(len(c.targets or []) for c in ensure)
+    batched = any((c.metrics_delta or {}).get("batched_ensure_tests_prep") for c in ensure)
+    return {
+        "ensure_tests_count": len(ensure),
+        "target_units": targets,
+        "batched": batched,
+        "question": (
+            "You are about to refactor without full test coverage. Push coverage to the limit "
+            "on all flagged production code before any structural refactors?"
+        ),
+        "reply_format": "yes or no",
+        "if_yes": "Drain ensure_tests with auto_proceed; never ask per class.",
+        "if_no": "confirm_changeset(skip) on each ensure_tests, then structural refactors.",
+    }
+
+
 def tool_get_report(
     out: str | None = None,
     workspace: str | None = None,
@@ -609,6 +677,28 @@ def tool_get_report(
         banner = payload.get("stale_banner") or _stale_report_banner(fresh)
         excerpt = payload.get("report_excerpt") or ""
         payload["report_excerpt"] = f"{banner}\n\n{excerpt}".strip()
+    prep = _prep_coverage_cta(out_dir)
+    if prep is not None:
+        payload["prep_coverage_cta"] = prep
+    if not is_stale:
+        slug = out_dir.name
+        queue_url = f"http://localhost:3000/runs/{slug}/queue"
+        bits = [
+            f"Queue UI: {queue_url} — Approve/Skip HITL items there, then tell me to execute the approved queue.",
+        ]
+        if prep is not None:
+            bits.append(
+                "Before structural walk: answer prep coverage yes/no "
+                f"({prep.get('ensure_tests_count', 0)} ensure_tests pending)."
+            )
+        else:
+            bits.append("No ensure_tests prep pending — ready for queue walk when you say so.")
+        existing = (payload.get("next_step") or "").strip()
+        payload["next_step"] = f"{' '.join(bits)}" + (f" {existing}" if existing else "")
+        payload["queue_url"] = queue_url
+        payload["execute_cta"] = (
+            "After Approve/Skip in the queue UI, tell the agent to execute the approved items."
+        )
     return payload
 
 
@@ -690,8 +780,12 @@ def _sample_queue_item(
     threshold: float,
     needs_confirmation: bool,
     hitl_reason: str | None,
+    out_dir: Path,
+    describe_mode: str = "raw",
 ) -> dict[str, Any]:
-    return {
+    enriched = enrich_targets(out_dir, cs.targets or [])
+    digest = _hitl_digest(cs, threshold, enriched_targets=enriched)
+    item: dict[str, Any] = {
         "id": cs.id,
         "title": cs.title,
         "action": cs.action,
@@ -700,13 +794,27 @@ def _sample_queue_item(
         "needs_confirmation": needs_confirmation,
         "auto_proceed": (not needs_confirmation) and hitl_reason != "blocked_deps",
         "hitl_reason": hitl_reason,
-        "hitl_digest": _hitl_digest(cs, threshold),
+        "hitl_digest": digest,
         "brief": cs.brief,
-        "targets": [
-            {"repo": t.repo, "path": t.path, "symbol": t.symbol, "unit_id": t.unit_id}
-            for t in (cs.targets or [])[:8]
-        ],
+        "targets": enriched[:8],
     }
+    if needs_confirmation:
+        decisions, optional = _hitl_choice_groups(
+            cs,
+            needs_confirmation=True,
+            describe_mode=describe_mode,
+            hitl_reason=hitl_reason,
+            threshold=threshold,
+        )
+        item["hitl_review"] = _hitl_review(
+            cs,
+            threshold=threshold,
+            hitl_reason=hitl_reason,
+            enriched_targets=enriched,
+            decisions=decisions,
+            optional=optional,
+        )
+    return item
 
 
 def _prep_units_unresolved(out_dir: Path, cs) -> tuple[bool, list[str]]:  # noqa: ANN001
@@ -827,16 +935,31 @@ def tool_sample_queue(
         auto_items.sort(key=lambda pair: (-float(pair[0].confidence), pair[0].id))
         hitl_items.sort(key=lambda pair: (float(pair[0].confidence), pair[0].id))
 
+    describe_mode = (
+        config.resolved_describe_mode()
+        if hasattr(config, "resolved_describe_mode")
+        else getattr(config, "describe_mode", "raw")
+    )
     counts = _queue_counts(out_dir, threshold=threshold, items=items)
     auto_sample = [
         _sample_queue_item(
-            c, threshold=threshold, needs_confirmation=False, hitl_reason=reason
+            c,
+            threshold=threshold,
+            needs_confirmation=False,
+            hitl_reason=reason,
+            out_dir=out_dir,
+            describe_mode=describe_mode,
         )
         for c, reason in auto_items[:1]
     ]
     hitl_sample = [
         _sample_queue_item(
-            c, threshold=threshold, needs_confirmation=True, hitl_reason=reason
+            c,
+            threshold=threshold,
+            needs_confirmation=True,
+            hitl_reason=reason,
+            out_dir=out_dir,
+            describe_mode=describe_mode,
         )
         for c, reason in hitl_items[:cap]
     ]
@@ -941,7 +1064,10 @@ def tool_get_next_changeset(
             "out_dir": str(out_dir),
             "loop": "done",
             "queue_counts": counts,
-            "next_step": "Changeset queue empty.",
+            "next_step": (
+                "Changeset queue empty. Before claiming done: run the project test suite "
+                "once (mvn test / pytest / npm test) and report results."
+            ),
         }
     assert result.changeset is not None
     cs = result.changeset
@@ -955,8 +1081,13 @@ def tool_get_next_changeset(
         needs_confirmation = False
     if unresolved and not hitl_reason:
         hitl_reason = "units_unresolved"
+    ui_approved = (cs.user_decision or "").strip().lower() == "proceed"
+    if ui_approved and not waiting and not unresolved:
+        needs_confirmation = False
+        hitl_reason = None
     auto_proceed = (not needs_confirmation) and not waiting
-    digest = _hitl_digest(cs, threshold)
+    enriched_targets = enrich_targets(out_dir, cs.targets or [])
+    digest = _hitl_digest(cs, threshold, enriched_targets=enriched_targets)
     if unresolved:
         paths_note = ", ".join(f"`{p}`" for p in target_paths) or "(no targets)"
         digest += f"\nunits_unresolved: no index units match targets {paths_note}"
@@ -986,6 +1117,12 @@ def tool_get_next_changeset(
             "and do not ask the user to confirm this item. Drain or skip the blocking "
             "prep changeset first, then call get_next_changeset again."
         )
+    elif auto_proceed and ui_approved:
+        next_step = (
+            "loop=autorun: UI already approved (user_decision=proceed). Do not ask again. "
+            "Call confirm_changeset(decision=proceed), apply the refactor, mark_changeset done, "
+            "then immediately call get_next_changeset. Drain the entire approved/autorun streak."
+        )
     elif auto_proceed:
         next_step = (
             "loop=autorun: Do not ask the user. Call confirm_changeset(decision=proceed) "
@@ -995,43 +1132,57 @@ def tool_get_next_changeset(
         )
     elif action_l == "document":
         next_step = (
-            "loop=hitl prep/document: Show hitl_digest; ask proceed/skip/blocked. "
+            "loop=hitl prep/document: Present hitl_review with code snippets; ask proceed/skip/blocked. "
             "Proceed = write in-source docs for targets"
             + (
                 " (server will apply generated descriptions when describe_mode=describe)"
                 if describe_mode == "describe"
                 else " (agent writes docs; describe_mode=raw has no generated text to apply)"
             )
-            + ". Do not offer a separate write_docs optional — that is this item."
+            + ". Do not offer a separate write_docs optional — that is this item. "
+            "Or point the user to Approve/Skip in the queue UI, then execute."
         )
     elif action_l == "ensure_tests":
         next_step = (
-            "loop=hitl prep/ensure_tests: Show hitl_digest; ask proceed/skip/blocked. "
-            "Proceed = scaffold/expand characterization tests for targets "
-            "(server may scaffold stubs). Do not offer a separate ensure_full_coverage optional."
+            "loop=autorun prep/ensure_tests: Do NOT ask the user — prep coverage yes/no already "
+            "decided. Proceed means write or expand characterization tests for listed targets "
+            "until Jacoco-relevant behavior is covered (test file exists ≠ done). "
+            "Call confirm_changeset(decision=proceed) if prep was yes, skip if prep was no, "
+            "then mark_changeset and get_next_changeset. Never show per-class proceed/skip/blocked."
         )
     elif hitl_reason == "architectural_wiring":
         next_step = (
-            "loop=hitl architectural_wiring: Show hitl_digest; ask wire_kafka_consumer vs "
+            "loop=hitl architectural_wiring: Present hitl_review with code snippets; ask wire_kafka_consumer vs "
             "remove_dead_wiring (or skip/blocked). Do not auto-apply extract_shared on "
-            "test-only handlers."
+            "test-only handlers. Or finish Approve/Skip in the queue UI, then execute."
         )
     elif hitl_reason == "security_sensitive":
         next_step = (
-            "loop=hitl security_sensitive: Show hitl_digest; never auto_proceed on committed "
+            "loop=hitl security_sensitive: Present hitl_review with code snippets; never auto_proceed on committed "
             "secrets/credentials. Ask proceed/skip/blocked; rotate secrets and externalize "
-            "via env/vault if proceeding."
+            "via env/vault if proceeding. Or finish Approve/Skip in the queue UI, then execute."
+        )
+    elif hitl_reason == "plan_review":
+        next_step = (
+            "loop=hitl plan_review: Planner marked this for human review. Present hitl_review "
+            "with rationale and code snippets; ask proceed/skip/blocked. "
+            "Or finish Approve/Skip in the queue UI, then execute."
         )
     else:
         next_step = (
-            "loop=hitl: Show hitl_digest to the user; ask proceed/skip/blocked; pass selected "
-            "optional_choices into confirm_changeset. Do not decide without an explicit user reply."
+            "loop=hitl: Present hitl_review (title, rationale, code snippets) to the user; "
+            "ask proceed/skip/blocked; pass selected optional_choices into confirm_changeset. "
+            "Do not decide without an explicit user reply. "
+            "Or finish Approve/Skip in the queue UI, then tell you to execute the approved queue."
         )
+    changeset_dump = cs.model_dump(mode="json")
+    changeset_dump["targets"] = enriched_targets
     payload = {
         "done": False,
         "out_dir": str(out_dir),
         "needs_confirmation": needs_confirmation,
         "auto_proceed": auto_proceed,
+        "user_decision": cs.user_decision,
         "confidence_threshold": threshold,
         "hitl_digest": digest,
         "questions": questions,
@@ -1039,16 +1190,27 @@ def tool_get_next_changeset(
         "optional_choices": optional,
         # Back-compat: decisions + optional flat list
         "hitl_choices": decisions + optional,
-        "changeset": cs.model_dump(mode="json"),
+        "changeset": changeset_dump,
         "next_step": next_step,
     }
+    if needs_confirmation and not waiting:
+        payload["hitl_review"] = _hitl_review(
+            cs,
+            threshold=threshold,
+            hitl_reason=hitl_reason,
+            enriched_targets=enriched_targets,
+            decisions=decisions,
+            optional=optional,
+        )
     fetch_ws = _verify_workspace_root(ws)
     fetch_metrics = _queue_fetch_baselines(fetch_ws, cs.targets or [])
     merged_metrics = dict(cs.metrics_delta or {})
     merged_metrics.update(fetch_metrics)
     if merged_metrics != (cs.metrics_delta or {}):
         cs = _patch_changeset(store, cs.id, metrics_delta=merged_metrics)
-        payload["changeset"] = cs.model_dump(mode="json")
+        changeset_dump = cs.model_dump(mode="json")
+        changeset_dump["targets"] = enriched_targets
+        payload["changeset"] = changeset_dump
     payload.update(
         _loop_payload(
             out_dir,
@@ -1068,9 +1230,16 @@ def _trim_sentence(text: str, *, max_chars: int = 160) -> str:
     return (cut or raw[: max_chars - 1]) + "…"
 
 
-def _hitl_digest(cs, threshold: float) -> str:  # noqa: ANN001
+def _hitl_digest(
+    cs,
+    threshold: float,
+    *,
+    enriched_targets: list[dict[str, Any]] | None = None,
+) -> str:  # noqa: ANN001
     """Short human digest for low-confidence confirm (also useful when auto_proceed)."""
-    why = _trim_sentence(cs.brief or cs.rationale or "")
+    why = _trim_sentence(
+        (getattr(cs, "rationale", None) or "") or (getattr(cs, "brief", None) or "")
+    )
     refs: list[str] = []
     for t in cs.targets[:6]:
         loc = f"`{t.repo}/{t.path}`" if t.repo else f"`{t.path}`"
@@ -1091,13 +1260,51 @@ def _hitl_digest(cs, threshold: float) -> str:  # noqa: ANN001
     if cs.depends_on:
         extras.append(f"depends_on={','.join(cs.depends_on)}")
     extra_line = f"\nNotes: {'; '.join(extras)}" if extras else ""
+    snippet_part = snippet_blocks_for_digest(enriched_targets or [])
     return (
         f"**{cs.title}** (`{cs.action}`) — confidence {cs.confidence:.2f} "
         f"(threshold {threshold:.2f})\n"
         f"{why}\n"
         f"Files: {ref_line}"
         f"{extra_line}"
+        f"{snippet_part}"
     )
+
+
+def _hitl_review(
+    cs,  # noqa: ANN001
+    *,
+    threshold: float,
+    hitl_reason: str | None,
+    enriched_targets: list[dict[str, Any]],
+    decisions: list[dict[str, str]],
+    optional: list[dict[str, str]],
+) -> dict[str, Any]:
+    from autorefactor.report.roi import changeset_why, plain_english_upside, upside_kind
+
+    why = changeset_why(cs, max_chars=320)
+    benefit = plain_english_upside(cs)
+    kind = upside_kind(cs)
+    finding_kind = str((cs.metrics_delta or {}).get("kind") or "") or None
+    compare = len(enriched_targets) >= 2 and kind == "dedup"
+    return {
+        "title": cs.title,
+        "action": cs.action,
+        "rationale": why,
+        "benefit": benefit if benefit and benefit != why else None,
+        "confidence": cs.confidence,
+        "threshold": threshold,
+        "hitl_reason": hitl_reason,
+        "finding_kind": finding_kind,
+        "upside_kind": kind,
+        "compare_targets": compare,
+        "targets": enriched_targets[:8],
+        "choices": decisions + optional,
+        "prompt": (
+            "What do you think? proceed / skip / blocked"
+            + (" — compare the side-by-side snippets first" if compare else "")
+        ),
+    }
 
 
 def _hitl_choice_groups(
@@ -1170,6 +1377,14 @@ def _hitl_confirm_choice(
             "id": "confirm_placement_risk",
             "label": (
                 "Placement move injects repository/persistence deps into a data/DTO type — "
+                "confirm briefly with the user"
+            ),
+        }
+    if reason == "plan_review":
+        return {
+            "id": "confirm_plan_review",
+            "label": (
+                "Planner asked for review (uncertain keep vs trash) — "
                 "confirm briefly with the user"
             ),
         }
@@ -1546,7 +1761,10 @@ def tool_get_changeset(
     item = _queue_store(out_dir).get(changeset_id)
     if item is None:
         return {"ok": False, "error": "not_found", "out_dir": str(out_dir)}
-    return {"ok": True, "out_dir": str(out_dir), "changeset": item.model_dump(mode="json")}
+    enriched = enrich_targets(out_dir, item.targets or [])
+    changeset_dump = item.model_dump(mode="json")
+    changeset_dump["targets"] = enriched
+    return {"ok": True, "out_dir": str(out_dir), "changeset": changeset_dump}
 
 
 _STRUCTURAL_VERIFY_ACTIONS = frozenset({"move", "extract_shared", "delete_duplicate"})
@@ -1897,10 +2115,18 @@ def tool_mark_changeset(
         )
     elif payload["loop"] == "hitl":
         payload["next_step"] = (
-            "Call get_next_changeset; show hitl_digest and ask the user before confirming."
+            "Call get_next_changeset; show hitl_digest and ask the user before confirming. "
+            "Or finish Approve/Skip in the queue UI, then tell you to execute."
         )
     else:
-        payload["next_step"] = "Changeset queue empty."
+        suite_hint = (
+            "Before claiming done: run the project test suite once "
+            "(mvn test / pytest / npm test — whatever the repo uses) and report results."
+        )
+        if payload["loop"] == "done" or status_enum == ChangesetStatus.DONE:
+            payload["next_step"] = f"Changeset queue empty or autorun streak ended. {suite_hint}"
+        else:
+            payload["next_step"] = f"Changeset queue empty. {suite_hint}"
     return payload
 
 

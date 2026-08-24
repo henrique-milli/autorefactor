@@ -47,17 +47,12 @@ def _production_class_stem_from_padding(path: str) -> str | None:
 
 
 def _unit_coverage_percent(unit: CodeUnit, coverage: CoverageSnapshot) -> float | None:
+    from autorefactor.coverage_paths import coverage_path_matches
+
     path = unit.path.replace("\\", "/")
     for st in coverage.files or []:
         sp = (st.path or "").replace("\\", "/")
-        if (
-            sp == path
-            or sp.endswith("/" + path)
-            or sp.endswith(path)
-            or path.endswith(sp)
-            or f"{unit.repo}/{path}" == sp
-            or sp.endswith(f"{unit.repo}/{path}")
-        ):
+        if coverage_path_matches(path, sp, repo=unit.repo):
             return float(st.percent)
     return None
 

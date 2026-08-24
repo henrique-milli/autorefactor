@@ -252,6 +252,7 @@ def run_analyze(
         workspace=config.workspace,
         repos=repos,
         coverage_finding_count=coverage_finding_count,
+        describe_mode=mode,
     )
     report("plan", 90, f"changesets={len(changesets)} confirmed={sum(1 for c in confirmed if c.valid)}")
 

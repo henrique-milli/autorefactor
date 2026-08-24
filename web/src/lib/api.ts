@@ -71,6 +71,7 @@ export type Metrics = {
   exact?: Record<string, unknown>;
   impact?: Record<string, unknown>;
   progress?: QueueProgress;
+  confidence_threshold?: number;
   roi?: {
     debt_score?: {
       value?: number;
@@ -138,16 +139,46 @@ export type GraphEdge = {
   kind: string;
 };
 
+export type ChangesetTarget = {
+  repo?: string;
+  path?: string;
+  symbol?: string;
+  unit_id?: string | null;
+  source_snippet?: string;
+};
+
 export type ChangesetLite = {
   id: string;
   title: string;
   action: string;
   brief?: string;
   rationale?: string;
+  /** One-sentence model reason for the flag (prefer over brief). */
+  why?: string;
+  /** Expected benefit / upside (may differ from why). */
+  benefit?: string;
   confidence?: number;
   status?: string;
+  needs_review?: boolean;
+  hitl_reason?: string | null;
+  finding_kind?: string | null;
+  upside_kind?: string | null;
+  /** UI decide-now: proceed | skip | blocked */
+  user_decision?: string | null;
+  /** True when this is a real multi-target dedup/clone comparison. */
+  compare_targets?: boolean;
   metrics_delta?: Record<string, unknown>;
-  targets?: { repo?: string; path?: string; unit_id?: string | null }[];
+  targets?: ChangesetTarget[];
+};
+
+export type UnitLite = {
+  id: string;
+  repo?: string;
+  path?: string;
+  kind?: string;
+  qualified_name?: string;
+  span?: { start_line?: number; end_line?: number };
+  source_snippet?: string;
 };
 
 const BASE =
@@ -189,6 +220,13 @@ export async function fetchChangesets(slug: string): Promise<ChangesetLite[]> {
   return data.changesets || [];
 }
 
+export async function fetchUnits(slug: string): Promise<UnitLite[]> {
+  const data = await getJson<{ units: UnitLite[] }>(
+    `/v1/runs/${encodeURIComponent(slug)}/units`,
+  );
+  return data.units || [];
+}
+
 export async function fetchProjection(slug: string) {
   return getJson<{ points: ProjectionPoint[]; point_count: number }>(
     `/v1/runs/${encodeURIComponent(slug)}/projection`,
@@ -213,6 +251,33 @@ export async function patchConfig(partial: Record<string, unknown>) {
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
+}
+
+export async function patchChangesetDecision(
+  slug: string,
+  changesetId: string,
+  decision: "proceed" | "skip" | "blocked" | null,
+) {
+  const res = await fetch(
+    `${BASE}/v1/runs/${encodeURIComponent(slug)}/changesets/${encodeURIComponent(changesetId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision }),
+    },
+  );
+  const body = (await res.json().catch(() => ({}))) as {
+    ok?: boolean;
+    error?: string;
+    changeset?: ChangesetLite & {
+      user_decision?: string | null;
+      needs_review?: boolean;
+    };
+  };
+  if (!res.ok || !body.ok) {
+    throw new Error(body.error || res.statusText || "Failed to save decision");
+  }
+  return body;
 }
 
 export async function fetchTemplates() {

@@ -172,6 +172,66 @@ def test_placement_emits_move_when_better_type() -> None:
     assert better.id in findings[0].unit_ids
 
 
+def test_placement_skips_mapper_into_aggregated_data() -> None:
+    """Mapper method embedding-matched to its param DTO must not become a move."""
+    mapper = _unit(
+        "mapper_type",
+        path="src/main/java/com/example/mapper/BonusResponseMapper.java",
+        qn="com.example.mapper.BonusResponseMapper",
+        kind=UnitKind.TYPE,
+        embedding=_emb(1, 0, 0),
+    )
+    data = _unit(
+        "agg_data",
+        path="src/main/java/com/example/service/BonusAggregationService.java",
+        qn="com.example.service.AggregatedBonusData",
+        kind=UnitKind.TYPE,
+        embedding=_emb(0, 1, 0),
+    )
+    fn = _unit(
+        "map_fn",
+        path="src/main/java/com/example/mapper/BonusResponseMapper.java",
+        qn="com.example.mapper.BonusResponseMapper.mapToBonusResponseWithAggregation",
+        embedding=_emb(0, 1, 0),
+        parent_id=mapper.id,
+        snippet=(
+            "public BonusResponse mapToBonusResponseWithAggregation("
+            "AggregatedBonusData aggregatedData) {\n"
+            + "    return build(aggregatedData);\n" * 20
+            + "}\n"
+        ),
+    )
+    assert PlacementSensor().collect(_ctx([fn, mapper, data])) == []
+
+
+def test_decision_rejects_cross_layer_mapper_move() -> None:
+    from autorefactor.sensors.validate import decision_structural_reason
+
+    mapper_fn = _unit(
+        "map_fn2",
+        path="src/main/java/com/example/mapper/BonusResponseMapper.java",
+        qn="com.example.mapper.BonusResponseMapper.mapToBonusResponseWithAggregation",
+        snippet="public BonusResponse map(AggregatedBonusData d) { return null; }\n",
+    )
+    data = _unit(
+        "agg_data2",
+        path="src/main/java/com/example/service/BonusAggregationService.java",
+        qn="com.example.service.AggregatedBonusData",
+        kind=UnitKind.TYPE,
+    )
+    units = {mapper_fn.id: mapper_fn, data.id: data}
+    reason = decision_structural_reason(
+        {
+            "valid": True,
+            "action": "move",
+            "unit_ids": [mapper_fn.id, data.id],
+        },
+        set(units),
+        units,
+    )
+    assert reason == "cross_layer_placement"
+
+
 def test_placement_skips_interface_declared_method_on_impl() -> None:
     """Interface method names parsed from TYPE snippet (no surviving FUNCTION child)."""
     iface = _unit(

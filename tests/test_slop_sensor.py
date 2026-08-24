@@ -103,6 +103,68 @@ func stringsTrimLower(s string) string {
     assert any("stringsTrimLower" in f.title or "stringsTrimLower" in f.evidence for f in findings)
 
 
+def test_slop_skips_same_file_config_validators(tmp_path: Path) -> None:
+    """Sibling validatePam* / validatePsn* if-chains are not delete_duplicate fodder."""
+    path = "src/main/java/com/example/config/ConfigurationValidator.java"
+    pam = _fn(
+        "pam",
+        "active",
+        path,
+        "ConfigurationValidator.validatePamConfiguration",
+        """
+private void validatePamConfiguration(StringBuilder errors) {
+    if (!StringUtils.hasText(pamBaseUrl)) {
+        errors.append("PAM base-url is not configured. ");
+    }
+    if (!StringUtils.hasText(pamClientId)) {
+        errors.append("PAM client-id is not configured. ");
+    }
+    if (!StringUtils.hasText(pamHmacSecret)) {
+        errors.append("PAM hmac-secret is not configured. ");
+    }
+}
+""",
+    )
+    psn = _fn(
+        "psn",
+        "active",
+        path,
+        "ConfigurationValidator.validatePsnConfiguration",
+        """
+private void validatePsnConfiguration(StringBuilder errors) {
+    if (!StringUtils.hasText(psnBootstrapServer)) {
+        errors.append("Pokerstars Kafka bootstrap.server is not configured. ");
+    }
+    if (!StringUtils.hasText(psnTransactionTopic)) {
+        errors.append("Pokerstars Kafka topics.transaction is not configured. ");
+    }
+    if (!StringUtils.hasText(psnConsumerGroupId)) {
+        errors.append("Pokerstars Kafka consumer.group-id is not configured. ");
+    }
+    if (psnSecurityEnabled && !StringUtils.hasText(psnJaasConfig)) {
+        errors.append("Pokerstars Kafka security.sasl.jaas.config is not configured. ");
+    }
+}
+""",
+    )
+    ctx = AnalysisContext(
+        workspace=tmp_path,
+        repos=(tmp_path / "active",),
+        units=(pam, psn),
+        config=AutorefactorConfig(workspace=tmp_path, skip_llm=True),
+        focus="slop",
+    )
+    findings = SlopSensor().collect(ctx)
+    clusters = [
+        f
+        for f in findings
+        if (f.metadata or {}).get("kind") == "slop_cluster"
+        or f.title.startswith("Slop cluster")
+    ]
+    assert clusters == []
+    assert not any(f.action_hint.value == "delete_duplicate" for f in findings)
+
+
 def test_slop_sensor_emits_score(tmp_path: Path) -> None:
     units = [
         _fn("a", "alpha", "svc/A.java", "A.computeTotal", _BODY_A),

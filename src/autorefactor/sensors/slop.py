@@ -21,7 +21,12 @@ from autorefactor.fingerprint import candidate_pairs, fingerprints_for_source
 from autorefactor.index.hierarchy import simple_name
 from autorefactor.sensors.base import AnalysisContext, Sensor
 from autorefactor.sensors.fingerprint import _skip_trivial
-from autorefactor.sensors.similarity import _loc, is_test_path
+from autorefactor.sensors.similarity import (
+    _DOMAIN_DIVERGENCE_SKIP,
+    _loc,
+    domain_token_divergence,
+    is_test_path,
+)
 
 _EMPTY_CATCH = re.compile(
     r"catch\s*\([^)]*\)\s*\{\s*\}|except\s+(\w+\s*)?:\s*(pass|continue)\b",
@@ -331,8 +336,29 @@ class SlopSensor:
         fps = {k: v for k, v in fps.items() if len(v) >= 2}
         by_id = {u.id: u for u in funcs}
 
-        pairs = candidate_pairs(fps, min_shared=1)
-        pairs = [(a, b, s) for a, b, s in pairs if s >= 0.70]
+        def _pair_is_slop_signal(a_id: str, b_id: str, score: float) -> bool:
+            """True when fingerprint overlap looks like real reimplementation drift."""
+            a, b = by_id[a_id], by_id[b_id]
+            # Same file: sibling helpers (validatePam* / validatePsn*) share if-chain
+            # shape — not agent fork surface to delete.
+            if (a.path or "").replace("\\", "/") == (b.path or "").replace("\\", "/"):
+                return False
+            # Different domain vocabulary → parallel patterns, not copies.
+            if domain_token_divergence(a.source_snippet or "", b.source_snippet or "") >= (
+                _DOMAIN_DIVERGENCE_SKIP
+            ):
+                return False
+            # Same-repo needs a higher bar than cross-repo echoes (match fingerprint sensor).
+            if a.repo == b.repo and score < 0.85:
+                return False
+            return True
+
+        pairs = candidate_pairs(fps, min_shared=2)
+        pairs = [
+            (a, b, s)
+            for a, b, s in pairs
+            if s >= 0.70 and a in by_id and b in by_id and _pair_is_slop_signal(a, b, s)
+        ]
 
         parent = {uid: uid for uid in fps}
 
@@ -349,8 +375,22 @@ class SlopSensor:
 
         clusters: dict[str, list[str]] = defaultdict(list)
         for uid in fps:
+            # Only union members that participated in a kept pair stay clustered;
+            # isolates with len 1 are dropped by the multi filter below.
             clusters[find(uid)].append(uid)
         multi = [members for members in clusters.values() if len(members) >= 2]
+        # Drop clusters that collapsed to a single path (should be rare after pair filter).
+        filtered_multi: list[list[str]] = []
+        for members in multi:
+            paths = {
+                (by_id[m].path or "").replace("\\", "/")
+                for m in members
+                if m in by_id
+            }
+            if len(paths) < 2:
+                continue
+            filtered_multi.append(members)
+        multi = filtered_multi
         multi.sort(key=len, reverse=True)
 
         n_funcs = max(1, len(funcs))
@@ -416,6 +456,9 @@ class SlopSensor:
             repos = sorted({u.repo for u in units})
             names = Counter(u.qualified_name.split(".")[-1] for u in units)
             label = names.most_common(1)[0][0] if names else "cluster"
+            # Slop clusters are shape/fingerprint affinity — never delete_duplicate.
+            # True interchangeable copies belong to sim.fingerprint at high Jaccard.
+            action = SuggestedAction.EXTRACT_SHARED
             f = try_make_finding(
                 id=content_hash("slop:cluster:" + ",".join(sorted(members)[:6])),
                 goal=self.goal,
@@ -427,16 +470,14 @@ class SlopSensor:
                     f"{', '.join(repos)} — likely agent reimplementation drift."
                 ),
                 unit_ids=members[:10],
-                action_hint=SuggestedAction.EXTRACT_SHARED
-                if len(members) >= 3
-                else SuggestedAction.DELETE_DUPLICATE,
+                action_hint=action,
                 score=min(0.93, 0.5 + 0.05 * len(members)),
                 metrics={
                     "cluster_size": float(len(members)),
                     "cross_repo": 1.0 if len(repos) >= 2 else 0.0,
                     "slop_score": slop_score,
                 },
-                metadata={"repos": repos},
+                metadata={"repos": repos, "kind": "slop_cluster"},
                 known_ids=known,
             )
             if f:

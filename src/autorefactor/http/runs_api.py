@@ -281,17 +281,167 @@ def load_run_text(slug: str, *parts: str) -> str | None:
         return None
 
 
+def truncate_source_snippet(text: str | None) -> str:
+    from autorefactor.snippets import truncate_source_snippet as _truncate
+
+    return _truncate(text)
+
+
+def _snippet_by_unit_id(slug: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for unit in load_units_light(slug) or []:
+        uid = unit.get("id")
+        snippet = unit.get("source_snippet")
+        if uid and snippet:
+            out[str(uid)] = str(snippet)
+    return out
+
+
+def _changeset_review_threshold(out_dir: Path) -> float:
+    from autorefactor.config_store import load_merged_config
+    from autorefactor.paths import load_run_identity
+
+    threshold = 0.6
+    ident = load_run_identity(out_dir)
+    ws = ident.get("workspace")
+    if ws:
+        try:
+            config = load_merged_config(workspace=Path(str(ws)), out_dir=out_dir)
+            threshold = float(config.confidence_threshold)
+        except Exception:  # noqa: BLE001
+            pass
+    return threshold
+
+
 def load_changesets(slug: str) -> list[Any] | None:
+    from autorefactor.changesets.models import ChangesetStatus
+    from autorefactor.changesets.store import changeset_needs_hitl
+    from autorefactor.queue import load_queue
+    from autorefactor.report.roi import changeset_why, plain_english_upside, upside_kind
+    from autorefactor.snippets import enrich_targets_from_snippet_map
+
     out_dir = resolve_run_dir(slug)
     if out_dir is None:
         return None
+    rows: list[Any] | None = None
     for rel in ("queue/changesets.json", "changesets/queue.json"):
         data = _read_json(out_dir / rel)
         if isinstance(data, list):
-            return data
+            rows = data
+            break
         if isinstance(data, dict) and isinstance(data.get("changesets"), list):
-            return data["changesets"]
-    return []
+            rows = data["changesets"]
+            break
+    if rows is None:
+        return []
+    snippets = _snippet_by_unit_id(slug)
+    threshold = _changeset_review_threshold(out_dir)
+    try:
+        queue_items = load_queue(out_dir)
+    except Exception:  # noqa: BLE001
+        queue_items = []
+    by_id = {c.id: c for c in queue_items}
+    ids_done = {c.id for c in queue_items if c.status == ChangesetStatus.DONE}
+    joined: list[Any] = []
+    for cs in rows:
+        if not isinstance(cs, dict):
+            joined.append(cs)
+            continue
+        targets = cs.get("targets")
+        if isinstance(targets, list):
+            new_targets = enrich_targets_from_snippet_map(targets, snippets)
+        else:
+            new_targets = targets
+        needs_review = False
+        hitl_reason: str | None = None
+        cs_model = by_id.get(str(cs.get("id") or ""))
+        if cs_model is not None and cs_model.status in {
+            ChangesetStatus.PENDING,
+            ChangesetStatus.IN_PROGRESS,
+        }:
+            deps_ok = all(dep in ids_done for dep in (cs_model.depends_on or []))
+            if deps_ok:
+                needs_review, hitl_reason = changeset_needs_hitl(
+                    cs_model,
+                    threshold,
+                    deps_satisfied=True,
+                    queue=queue_items,
+                )
+        md = cs.get("metrics_delta") if isinstance(cs.get("metrics_delta"), dict) else {}
+        finding_kind = str((md or {}).get("kind") or "") or None
+        row = {**cs, "targets": new_targets}
+        row["needs_review"] = needs_review
+        row["hitl_reason"] = hitl_reason
+        row["finding_kind"] = finding_kind
+        row["user_decision"] = (
+            cs_model.user_decision
+            if cs_model is not None
+            else cs.get("user_decision")
+        )
+        if cs_model is not None:
+            row["why"] = changeset_why(cs_model)
+            row["benefit"] = plain_english_upside(cs_model)
+            row["upside_kind"] = upside_kind(cs_model)
+            row["compare_targets"] = len(cs_model.targets or []) >= 2 and upside_kind(
+                cs_model
+            ) == "dedup"
+        else:
+            why_raw = (cs.get("rationale") or cs.get("brief") or "").strip()
+            row["why"] = " ".join(why_raw.split())[:280] if why_raw else ""
+            row["benefit"] = ""
+            row["upside_kind"] = None
+            row["compare_targets"] = len(new_targets or []) >= 2
+        joined.append(row)
+    return joined
+
+
+def apply_changeset_decision(
+    slug: str,
+    changeset_id: str,
+    decision: str | None,
+) -> dict[str, Any]:
+    """UI review: approve (proceed), skip, blocked, or undo (null)."""
+    from autorefactor.changesets.store import changeset_needs_hitl, set_user_decision
+
+    out_dir = resolve_run_dir(slug)
+    if out_dir is None:
+        return {"ok": False, "error": "not_found"}
+    try:
+        updated = set_user_decision(out_dir, changeset_id, decision)
+    except KeyError:
+        return {"ok": False, "error": "changeset_not_found"}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    threshold = _changeset_review_threshold(out_dir)
+    from autorefactor.queue import load_queue
+
+    queue_items = load_queue(out_dir)
+    ids_done = {
+        c.id
+        for c in queue_items
+        if c.status.value == "done"
+    }
+    deps_ok = all(dep in ids_done for dep in (updated.depends_on or []))
+    needs_review = False
+    hitl_reason = None
+    if updated.status.value in {"pending", "in_progress"} and deps_ok:
+        needs_review, hitl_reason = changeset_needs_hitl(
+            updated, threshold, deps_satisfied=True, queue=queue_items
+        )
+    return {
+        "ok": True,
+        "changeset": {
+            "id": updated.id,
+            "title": updated.title,
+            "action": updated.action,
+            "status": updated.status.value,
+            "user_decision": updated.user_decision,
+            "needs_review": needs_review,
+            "hitl_reason": hitl_reason,
+            "notes": updated.notes,
+        },
+    }
 
 
 def load_metrics_with_progress(slug: str) -> dict[str, Any] | None:
@@ -301,9 +451,12 @@ def load_metrics_with_progress(slug: str) -> dict[str, Any] | None:
     data = load_run_json(slug, "report", "metrics.json")
     if not isinstance(data, dict):
         return None
+    out_dir = resolve_run_dir(slug)
     changesets = load_changesets(slug) or []
     out = dict(data)
     out["progress"] = compute_queue_progress(data, changesets)
+    if out_dir is not None:
+        out["confidence_threshold"] = _changeset_review_threshold(out_dir)
     return out
 
 
@@ -331,6 +484,7 @@ def load_units_light(slug: str) -> list[dict[str, Any]] | None:
                     "kind": u.get("kind"),
                     "qualified_name": u.get("qualified_name"),
                     "span": span,
+                    "source_snippet": truncate_source_snippet(u.get("source_snippet")),
                 }
             )
         return light

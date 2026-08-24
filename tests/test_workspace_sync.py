@@ -210,6 +210,22 @@ def test_list_walk_without_git(tmp_path: Path) -> None:
     assert "f.txt" in files
 
 
+def test_list_workspace_includes_jacoco_xml_under_target(tmp_path: Path) -> None:
+    src = tmp_path / "plain"
+    src.mkdir()
+    (src / "src" / "a.py").parent.mkdir(parents=True)
+    (src / "src" / "a.py").write_text("x=1\n", encoding="utf-8")
+    jacoco = src / "target" / "site" / "jacoco" / "jacoco.xml"
+    jacoco.parent.mkdir(parents=True)
+    jacoco.write_text("<report/>\n", encoding="utf-8")
+    (src / "target" / "classes" / "A.class").parent.mkdir(parents=True)
+    (src / "target" / "classes" / "A.class").write_bytes(b"xx")
+    files = list_workspace_files(src)
+    assert "src/a.py" in files
+    assert any(f.endswith("jacoco.xml") for f in files)
+    assert not any(f.endswith(".class") for f in files)
+
+
 def test_export_active_and_extract_roundtrip(tmp_path: Path, monkeypatch) -> None:
     home = tmp_path / "home"
     home.mkdir()

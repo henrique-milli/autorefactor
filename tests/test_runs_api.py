@@ -140,3 +140,157 @@ def test_templates() -> None:
     assert "fully_local" in ids
     assert data["templates"][0].get("chat_backend")
     assert "presets" not in data
+
+
+def test_units_light_truncates_and_joins_changeset_targets(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(runs_api, "autorefactor_home", lambda: tmp_path)
+    run = tmp_path / "runs" / "snip-run"
+    (run / "analyze").mkdir(parents=True)
+    (run / "queue").mkdir()
+    long_src = "\n".join(f"line {i} {'x' * 80}" for i in range(80))
+    (run / "analyze" / "units.json").write_text(
+        json.dumps(
+            {
+                "units": [
+                    {
+                        "id": "u1",
+                        "repo": "demo",
+                        "path": "A.java",
+                        "kind": "function",
+                        "qualified_name": "A.foo",
+                        "span": {"start_line": 1, "end_line": 80},
+                        "source_snippet": long_src,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run / "queue" / "changesets.json").write_text(
+        json.dumps(
+            {
+                "changesets": [
+                    {
+                        "id": "cs1",
+                        "title": "split foo",
+                        "action": "split",
+                        "brief": "b",
+                        "rationale": "r",
+                        "targets": [
+                            {
+                                "repo": "demo",
+                                "path": "A.java",
+                                "symbol": "A.foo",
+                                "unit_id": "u1",
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run / "report").mkdir()
+    (run / "report" / "projection.json").write_text(
+        json.dumps({"points": [{"unit_id": "u1"}], "point_count": 1}),
+        encoding="utf-8",
+    )
+
+    units = runs_api.load_units_light("snip-run")
+    assert units is not None and len(units) == 1
+    snippet = units[0]["source_snippet"]
+    assert snippet.startswith("line 0")
+    assert snippet.count("\n") < 40
+    assert len(snippet) <= 1200
+    assert "line 79" not in snippet
+
+    changesets = runs_api.load_changesets("snip-run")
+    assert changesets and changesets[0]["targets"][0]["source_snippet"] == snippet
+
+    projection = runs_api.load_run_json("snip-run", "report", "projection.json")
+    assert "source_snippet" not in json.dumps(projection)
+
+
+def test_load_changesets_marks_needs_review_for_low_confidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(runs_api, "autorefactor_home", lambda: tmp_path)
+    run = tmp_path / "runs" / "review-run"
+    (run / "analyze").mkdir(parents=True)
+    (run / "queue").mkdir()
+    (run / "report").mkdir()
+    (run / "report" / "metrics.json").write_text("{}", encoding="utf-8")
+    (run / "analyze" / "units.json").write_text(
+        json.dumps(
+            {
+                "units": [
+                    {
+                        "id": "u1",
+                        "repo": "demo",
+                        "path": "A.java",
+                        "kind": "function",
+                        "qualified_name": "A.foo",
+                        "source_snippet": "class A { void foo() {} }",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run / "queue" / "changesets.json").write_text(
+        json.dumps(
+            {
+                "changesets": [
+                    {
+                        "id": "auto",
+                        "title": "safe split",
+                        "action": "split",
+                        "brief": "b",
+                        "rationale": "r",
+                        "confidence": 0.95,
+                        "status": "pending",
+                        "targets": [{"repo": "demo", "path": "A.java", "unit_id": "u1"}],
+                    },
+                    {
+                        "id": "hitl",
+                        "title": "risky split",
+                        "action": "split",
+                        "brief": "## markdown brief",
+                        "rationale": "Nesting too deep — split the hot path.",
+                        "confidence": 0.25,
+                        "status": "pending",
+                        "targets": [{"repo": "demo", "path": "A.java", "unit_id": "u1"}],
+                    },
+                    {
+                        "id": "draft",
+                        "title": "Draft map",
+                        "action": "extract_shared",
+                        "brief": "## Draft",
+                        "rationale": "HashMap defaults without config — silent skip risk.",
+                        "confidence": 0.76,
+                        "status": "pending",
+                        "metrics_delta": {
+                            "kind": "draft_in_memory_map",
+                            "estimated_loc_removed": 22,
+                        },
+                        "targets": [{"repo": "demo", "path": "A.java", "unit_id": "u1"}],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows = {c["id"]: c for c in runs_api.load_changesets("review-run") or []}
+    assert rows["auto"]["needs_review"] is False
+    assert rows["hitl"]["needs_review"] is True
+    assert rows["hitl"]["hitl_reason"] == "low_confidence"
+    assert rows["hitl"]["why"] == "Nesting too deep — split the hot path."
+    assert rows["draft"]["needs_review"] is True
+    assert rows["draft"]["finding_kind"] == "draft_in_memory_map"
+    assert "silent skip" in rows["draft"]["why"]
+    assert "HashMap" in rows["draft"]["benefit"] or "config" in rows["draft"]["benefit"]
+    assert rows["draft"]["compare_targets"] is False
+    assert "Share/delete" not in (rows["draft"]["benefit"] or "")

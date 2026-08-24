@@ -9,7 +9,8 @@ import {
 } from "react";
 import { Canvas } from "@react-three/fiber";
 import { OrbitControls, Grid, Html, Line } from "@react-three/drei";
-import type { ChangesetLite, GraphEdge, ProjectionPoint, UpsideRow } from "@/lib/api";
+import type { ChangesetLite, GraphEdge, ProjectionPoint, UnitLite, UpsideRow } from "@/lib/api";
+import { SnippetPreview } from "@/components/code/SnippetPreview";
 import { Sheet } from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
 import { KindBadge } from "@/components/ui/badge";
@@ -22,6 +23,7 @@ const KIND_COLOR: Record<string, string> = {
   structure: "#c45c26",
   safety: "#2f6f4e",
   docs: "#3d6d8c",
+  slop: "#b45309",
 };
 
 const COLOR_LEGEND: { key: string; label: string; color: string }[] = [
@@ -29,6 +31,7 @@ const COLOR_LEGEND: { key: string; label: string; color: string }[] = [
   { key: "structure", label: "Structure / split (queued)", color: KIND_COLOR.structure },
   { key: "safety", label: "Tests / safety (queued)", color: KIND_COLOR.safety },
   { key: "docs", label: "Docs (queued)", color: KIND_COLOR.docs },
+  { key: "slop", label: "Slop / draft (queued)", color: KIND_COLOR.slop },
   { key: "function", label: "Function (not queued)", color: KIND_COLOR.function },
   { key: "type", label: "Type (not queued)", color: KIND_COLOR.type },
 ];
@@ -46,6 +49,7 @@ function pointRoleLabel(p: ProjectionPoint): string {
   if (p.upside_kind === "structure") return "Structure / split opportunity";
   if (p.upside_kind === "safety") return "Tests / safety opportunity";
   if (p.upside_kind === "docs") return "Docs opportunity";
+  if (p.upside_kind === "slop") return "Slop / draft behavior";
   if (p.on_queue) return "Queued unit";
   return p.kind === "type" ? "Type (not on queue)" : "Function (not on queue)";
 }
@@ -296,6 +300,7 @@ function shortName(qualified: string): string {
 function UnitDetail({
   selected,
   pointsById,
+  unitsById,
   edges,
   changesetsById,
   upsideById,
@@ -305,6 +310,7 @@ function UnitDetail({
 }: {
   selected: ProjectionPoint;
   pointsById: Map<string, ProjectionPoint>;
+  unitsById: Map<string, UnitLite>;
   edges: GraphEdge[];
   changesetsById: Map<string, ChangesetLite>;
   upsideById: Record<string, UpsideRow>;
@@ -344,6 +350,12 @@ function UnitDetail({
   })();
 
   const color = pointColor(selected);
+  const selectedUnit = unitsById.get(selected.unit_id);
+  const cloneNeighbors = neighbors.filter((n) => n.kind === "clone");
+  const codePairUnitIds = new Set<string>([selected.unit_id]);
+  for (const n of cloneNeighbors.slice(0, 3)) {
+    codePairUnitIds.add(n.other.unit_id);
+  }
 
   return (
     <div className="space-y-5">
@@ -373,6 +385,40 @@ function UnitDetail({
       </div>
 
       <section>
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-muted">
+          {cloneNeighbors.length ? "Code pair" : "Code"}
+        </h3>
+        {cloneNeighbors.length ? (
+          <div className="mt-2 grid gap-2 sm:grid-cols-2">
+            <SnippetPreview
+              path={`${selected.repo}/${selected.path}`}
+              symbol={selected.qualified_name}
+              snippet={selectedUnit?.source_snippet}
+            />
+            {cloneNeighbors.slice(0, 3).map((n) => {
+              const otherUnit = unitsById.get(n.other.unit_id);
+              return (
+                <SnippetPreview
+                  key={n.other.unit_id}
+                  path={`${n.other.repo}/${n.other.path}`}
+                  symbol={n.other.qualified_name}
+                  snippet={otherUnit?.source_snippet}
+                />
+              );
+            })}
+          </div>
+        ) : (
+          <div className="mt-2">
+            <SnippetPreview
+              path={`${selected.repo}/${selected.path}`}
+              symbol={selected.qualified_name}
+              snippet={selectedUnit?.source_snippet}
+            />
+          </div>
+        )}
+      </section>
+
+      <section>
         <h3 className="text-xs font-semibold uppercase tracking-wide text-muted">Flagged for</h3>
         {flags.length ? (
           <ul className="mt-2 space-y-3">
@@ -391,9 +437,53 @@ function UnitDetail({
                   ) : null}
                 </div>
                 <p className="mt-1.5 text-sm font-medium leading-snug">{cs?.title || up?.title || id}</p>
+                {(cs?.why || cs?.rationale) ? (
+                  <p className="mt-1 text-xs leading-relaxed text-ink">
+                    <span className="font-medium text-muted">Why flagged: </span>
+                    {cs.why || cs.rationale}
+                  </p>
+                ) : null}
                 <p className="mt-1 text-xs leading-relaxed text-muted">
-                  {up?.plain_english || up?.upside || cs?.brief || cs?.rationale || "Queued for this unit."}
+                  {cs?.benefit ||
+                    up?.plain_english ||
+                    up?.upside ||
+                    cs?.brief ||
+                    "Queued for this unit."}
                 </p>
+                {cs?.targets?.length ? (
+                  <div className="mt-2">
+                    {cs.compare_targets && cs.targets.length >= 2 ? (
+                      <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted">
+                        Compared units
+                      </p>
+                    ) : cs.targets.length === 1 ? (
+                      <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted">
+                        Flagged unit
+                      </p>
+                    ) : null}
+                    <div
+                      className={`grid gap-2 ${
+                        cs.compare_targets && cs.targets.length >= 2
+                          ? "sm:grid-cols-2"
+                          : ""
+                      }`}
+                    >
+                      {cs.targets.map((t, i) => {
+                        if (t.unit_id && codePairUnitIds.has(t.unit_id)) return null;
+                        return (
+                          <SnippetPreview
+                            key={`${id}-${t.unit_id || t.path || i}`}
+                            path={
+                              t.repo && t.path ? `${t.repo}/${t.path}` : t.path
+                            }
+                            symbol={t.symbol}
+                            snippet={t.source_snippet}
+                          />
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : null}
                 <div className="mt-2 flex flex-wrap gap-3 text-xs">
                   <Link className="text-accent hover:underline" href={`/runs/${slug}/queue`}>
                     Open in queue
@@ -578,6 +668,7 @@ export function VectorMap({
   points,
   edges,
   changesets = [],
+  units = [],
   upsideById = {},
   focusChangesetId,
   slug,
@@ -585,6 +676,7 @@ export function VectorMap({
   points: ProjectionPoint[];
   edges: GraphEdge[];
   changesets?: ChangesetLite[];
+  units?: UnitLite[];
   upsideById?: Record<string, UpsideRow>;
   focusChangesetId?: string | null;
   slug: string;
@@ -663,6 +755,19 @@ export function VectorMap({
     () => new Map(changesets.map((c) => [c.id, c])),
     [changesets],
   );
+
+  const unitsById = useMemo(
+    () => new Map(units.map((u) => [u.id, u])),
+    [units],
+  );
+
+  const selectedHasClone =
+    !!selected &&
+    edges.some(
+      (e) =>
+        e.kind === "clone" &&
+        (e.source === selected.unit_id || e.target === selected.unit_id),
+    );
 
   const use3d = webglOk === true;
 
@@ -749,11 +854,13 @@ export function VectorMap({
         open={!!selected}
         onOpenChange={(o) => !o && setSelected(null)}
         title={selected ? shortName(selected.qualified_name) : "Unit"}
+        wide={selectedHasClone}
       >
         {selected ? (
           <UnitDetail
             selected={selected}
             pointsById={pointsById}
+            unitsById={unitsById}
             edges={edges}
             changesetsById={changesetsById}
             upsideById={upsideById}

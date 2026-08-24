@@ -22,6 +22,7 @@ export function KindBadge({ kind }: { kind?: string }) {
     structure: "border-queue/40 bg-orange-50 text-queue",
     safety: "border-emerald-300 bg-emerald-50 text-emerald-800",
     docs: "border-sky-300 bg-sky-50 text-sky-800",
+    slop: "border-amber-400/50 bg-amber-50 text-amber-900",
   };
   const k = kind || "structure";
   return <Badge className={colors[k] || ""}>{k}</Badge>;
