@@ -67,6 +67,31 @@ def test_fingerprint_sensor_finds_renamed_clone(tmp_path: Path) -> None:
     assert any(f.sensor == "sim.fingerprint" for f in findings)
 
 
+def test_identity_helpers_python_nested_def_no_redos() -> None:
+    """Nested defs must not ReDoS the identity scanner (cross-repo smoke hang)."""
+    from autorefactor.sensors.slop import _identity_helpers_in_source
+
+    body = (
+        "def main() -> None:\n"
+        "    calls = {\"n\": 0}\n"
+        "\n"
+        "    def fake_urlopen(req, timeout=180):\n"
+        "        calls[\"n\"] += 1\n"
+        "        if calls[\"n\"] == 1:\n"
+        "            raise RuntimeError(\"retry\")\n"
+        "        return b\"ok\"\n"
+        "\n"
+        "    assert calls[\"n\"] == 0\n"
+        "    print(\"done\")\n"
+    )
+    # Pad to amplify backtracking on the old unbounded line-loop pattern.
+    body = body + ("    x = 1\n" * 200)
+    assert _identity_helpers_in_source(body, "python") == []
+    # Still detects a real short identity helper.
+    id_body = "def noop(x):\n    return x\n"
+    assert _identity_helpers_in_source(id_body, "python") == [("noop", "x")]
+
+
 def test_slop_identity_helper_go(tmp_path: Path) -> None:
     body = '''package util
 

@@ -35,9 +35,31 @@ def write_embedding_projection(
     if len(vectors) < 5:
         return None
 
+    highlight_ids = {
+        t.unit_id
+        for cs in changesets
+        for t in cs.targets
+        if t.unit_id
+    }
+
+    # t-SNE is roughly O(n²); subsample large maps so multi-repo analyze finishes.
+    _MAX_POINTS = 2500
+    if len(vectors) > _MAX_POINTS:
+        rng = np.random.default_rng(42)
+        prefer = [i for i, u in enumerate(meta) if u.id in highlight_ids]
+        rest = [i for i in range(len(meta)) if i not in set(prefer)]
+        need = max(0, _MAX_POINTS - len(prefer))
+        if need and rest:
+            pick_rest = rng.choice(rest, size=min(need, len(rest)), replace=False).tolist()
+        else:
+            pick_rest = []
+        keep = sorted((prefer + pick_rest)[:_MAX_POINTS])
+        vectors = [vectors[i] for i in keep]
+        meta = [meta[i] for i in keep]
+
     from sklearn.manifold import TSNE
 
-    matrix = np.array(vectors, dtype=np.float64)
+    matrix = np.array(vectors, dtype=np.float32)
     perplexity = max(2, min(30, len(vectors) - 1))
     coords = TSNE(
         n_components=2,
@@ -53,12 +75,6 @@ def write_embedding_projection(
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
-    highlight_ids = {
-        t.unit_id
-        for cs in changesets
-        for t in cs.targets
-        if t.unit_id
-    }
     id_to_idx = {u.id: i for i, u in enumerate(meta)}
 
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -200,6 +200,8 @@ def try_make_finding(**kwargs: Any) -> Finding | None:
         return make_finding(**kwargs)
     except FindingValidationError:
         return None
+    except Exception:  # noqa: BLE001 — pydantic ValidationError etc.
+        return None
 
 
 class PlannerDecision(BaseModel):

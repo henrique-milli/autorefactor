@@ -180,6 +180,11 @@ def _methods_from_type_snippet(snippet: str) -> set[str]:
 
 def _type_declared_methods(ctx: AnalysisContext) -> dict[str, set[str]]:
     """Map TYPE unit id → declared method simple names (indexed FUNCTION children)."""
+    type_by_repo_qn: dict[tuple[str, str], str] = {
+        (t.repo, t.qualified_name): t.id
+        for t in ctx.units
+        if t.kind == UnitKind.TYPE
+    }
     methods: dict[str, set[str]] = {}
     for unit in ctx.units:
         if unit.kind != UnitKind.FUNCTION:
@@ -187,10 +192,7 @@ def _type_declared_methods(ctx: AnalysisContext) -> dict[str, set[str]]:
         owner_id = unit.parent_id
         if not owner_id and "." in unit.qualified_name:
             parent_qn = unit.qualified_name.rsplit(".", 1)[0]
-            for t in ctx.units:
-                if t.kind == UnitKind.TYPE and t.repo == unit.repo and t.qualified_name == parent_qn:
-                    owner_id = t.id
-                    break
+            owner_id = type_by_repo_qn.get((unit.repo, parent_qn))
         if not owner_id:
             continue
         methods.setdefault(owner_id, set()).add(simple_name(unit.qualified_name))
@@ -251,35 +253,44 @@ class PlacementSensor:
         if not types:
             return []
         type_matrix = np.array([t.embedding for t in types], dtype=np.float64)
+        type_norms = np.linalg.norm(type_matrix, axis=1, keepdims=True)
+        type_normed = type_matrix / np.clip(type_norms, 1e-12, None)
+        # Pre-group types by repo for vectorized method↔type scoring.
+        types_by_repo: dict[str, list[int]] = {}
+        type_by_repo_qn: dict[tuple[str, str], str] = {}
+        for i, t in enumerate(types):
+            types_by_repo.setdefault(t.repo, []).append(i)
+            type_by_repo_qn[(t.repo, t.qualified_name)] = t.id
         type_methods = _type_declared_methods(ctx)
         interface_by_qn = _interface_methods_by_qn(ctx, type_methods)
         findings: list[Finding] = []
         max_flags = ctx.config.max_similarity_pairs
 
         for fn in functions:
-            owner_id = None
             parent_qn = fn.qualified_name.rsplit(".", 1)[0] if "." in fn.qualified_name else None
-            for t in types:
-                if t.repo == fn.repo and t.qualified_name == parent_qn:
-                    owner_id = t.id
-                    break
-            if owner_id is None and fn.parent_id:
-                owner_id = fn.parent_id
+            owner_id = (
+                type_by_repo_qn.get((fn.repo, parent_qn)) if parent_qn else None
+            ) or fn.parent_id
 
-            fn_vec = np.array(fn.embedding, dtype=np.float64)
-            best_i, best_sim = -1, 0.0
-            owner_sim = 0.0
-            for i, t in enumerate(types):
-                if t.repo != fn.repo:
-                    continue
-                sim = cosine(fn_vec, type_matrix[i])
-                if owner_id and t.id == owner_id:
-                    owner_sim = sim
-                if sim > best_sim:
-                    best_sim = sim
-                    best_i = i
-            if best_i < 0:
+            repo_idxs = types_by_repo.get(fn.repo) or []
+            if not repo_idxs:
                 continue
+            fn_vec = np.array(fn.embedding, dtype=np.float64)
+            fn_norm = float(np.linalg.norm(fn_vec))
+            if fn_norm <= 1e-12:
+                continue
+            fn_unit = fn_vec / fn_norm
+            repo_mat = type_normed[repo_idxs]
+            sims = repo_mat @ fn_unit
+            best_local = int(np.argmax(sims))
+            best_i = repo_idxs[best_local]
+            best_sim = float(sims[best_local])
+            owner_sim = 0.0
+            if owner_id:
+                for local_i, type_i in enumerate(repo_idxs):
+                    if types[type_i].id == owner_id:
+                        owner_sim = float(sims[local_i])
+                        break
             best = types[best_i]
 
             if best_sim < floor:

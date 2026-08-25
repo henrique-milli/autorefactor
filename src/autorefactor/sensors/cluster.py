@@ -34,7 +34,14 @@ class ClusterSensor:
         except ImportError:
             logger.warning("hdbscan not available; skipping cluster sensor")
             return []
-        matrix = np.array([u.embedding for u in candidates], dtype=np.float64)
+        # HDBSCAN is roughly O(n²) in high-d; subsample large workspaces so sensors finish.
+        _MAX = 2500
+        if len(candidates) > _MAX:
+            rng = np.random.default_rng(0)
+            pick = rng.choice(len(candidates), size=_MAX, replace=False)
+            candidates = [candidates[i] for i in sorted(pick.tolist())]
+            logger.info("cluster sensor subsampled to %d functions", _MAX)
+        matrix = np.array([u.embedding for u in candidates], dtype=np.float32)
         labels = hdbscan.HDBSCAN(min_cluster_size=3, metric="euclidean").fit_predict(matrix)
         by_label: dict[int, list] = {}
         for unit, label in zip(candidates, labels, strict=True):

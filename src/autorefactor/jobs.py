@@ -154,7 +154,7 @@ def _reconcile_orphan(job_id: str, data: dict[str, Any]) -> dict[str, Any]:
     data["result"] = {
         "ok": False,
         "error": "orphaned",
-        "detail": "Analyze job thread is no longer running.",
+        "detail": "Analyze job thread is no longer running (process restart or crash during analyze).",
     }
     _write(job_id, data)
     _clear_lock(job_id, data)

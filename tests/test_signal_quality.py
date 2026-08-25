@@ -1107,3 +1107,71 @@ def test_domain_divergence_skips_extract_shared() -> None:
         in {SuggestedAction.EXTRACT_SHARED, SuggestedAction.DELETE_DUPLICATE}
         for f in twin_findings
     )
+
+
+def test_similarity_scales_past_naive_pairwise_without_missing_clone() -> None:
+    """Large groups must finish quickly and still surface a planted near-duplicate."""
+    import time
+
+    dim = 32
+    rng = np.random.default_rng(0)
+    units: list[CodeUnit] = []
+    for i in range(250):
+        vec = rng.normal(size=dim)
+        units.append(
+            _unit(
+                f"noise{i}",
+                path=f"src/main/java/Noise{i}.java",
+                qn=f"Noise{i}.run",
+                snippet=(
+                    f"void run{i}() {{\n"
+                    + "\n".join(f"    step{j}();" for j in range(12))
+                    + "\n}\n"
+                ),
+                embedding=(vec / np.linalg.norm(vec)).tolist(),
+                start=1,
+                end=20,
+                repo=f"repo{i % 5}",
+            )
+        )
+    shared = np.ones(dim)
+    shared = (shared / np.linalg.norm(shared)).tolist()
+    clone_src = (
+        "void processBonus() {\n"
+        + "\n".join(f"    handleBonusStep{j}();" for j in range(20))
+        + "\n}\n"
+    )
+    a = _unit(
+        "cloneA",
+        path="src/main/java/A.java",
+        qn="A.processBonus",
+        snippet=clone_src,
+        embedding=shared,
+        start=1,
+        end=25,
+        repo="alpha",
+    )
+    b = _unit(
+        "cloneB",
+        path="src/main/java/B.java",
+        qn="B.processBonus",
+        snippet=clone_src,
+        embedding=shared,
+        start=1,
+        end=25,
+        repo="beta",
+    )
+    units.extend([a, b])
+
+    t0 = time.perf_counter()
+    findings = emit_similarity_findings(
+        units,
+        kinds={UnitKind.FUNCTION},
+        goal=AnalysisGoal.METHOD_SIMILARITY,
+        sensor="sim.method",
+        threshold=0.78,
+        max_pairs=20,
+    )
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 8.0, f"similarity too slow on 252 units: {elapsed:.2f}s"
+    assert any(a.id in f.unit_ids and b.id in f.unit_ids for f in findings)

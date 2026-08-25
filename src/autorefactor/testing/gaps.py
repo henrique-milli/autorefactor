@@ -116,6 +116,15 @@ def _is_production_unit(unit: CodeUnit) -> bool:
     }
 
 
+def index_production_units_by_repo(all_units: list[CodeUnit]) -> dict[str, list[CodeUnit]]:
+    """Precompute non-trivial production units keyed by repo (hot path for followups)."""
+    by_repo: dict[str, list[CodeUnit]] = defaultdict(list)
+    for unit in all_units:
+        if _is_production_unit(unit) and not _is_trivial_production_unit(unit):
+            by_repo[unit.repo].append(unit)
+    return by_repo
+
+
 def _pick_production_units(
     repo: str,
     all_units: list[CodeUnit],
@@ -123,13 +132,17 @@ def _pick_production_units(
     coverage: CoverageSnapshot | None,
     padding_path: str | None = None,
     limit: int = 3,
+    production_by_repo: dict[str, list[CodeUnit]] | None = None,
 ) -> list[CodeUnit]:
     """Highest-priority uncovered production units for a repo (or padding sibling)."""
-    candidates = [
-        u
-        for u in all_units
-        if u.repo == repo and _is_production_unit(u) and not _is_trivial_production_unit(u)
-    ]
+    if production_by_repo is not None:
+        candidates = list(production_by_repo.get(repo) or [])
+    else:
+        candidates = [
+            u
+            for u in all_units
+            if u.repo == repo and _is_production_unit(u) and not _is_trivial_production_unit(u)
+        ]
     if padding_path:
         stem = _production_class_stem_from_padding(padding_path)
         if stem:
@@ -177,14 +190,21 @@ def _units_for_mock_test_stems(
     *,
     coverage: CoverageSnapshot | None,
     limit: int,
+    production_by_repo: dict[str, list[CodeUnit]] | None = None,
 ) -> list[CodeUnit]:
     if not stems:
         return []
+    pool = (
+        production_by_repo.get(repo) or []
+        if production_by_repo is not None
+        else [
+            u
+            for u in all_units
+            if u.repo == repo and _is_production_unit(u) and not _is_trivial_production_unit(u)
+        ]
+    )
     matches = [
-        u
-        for u in all_units
-        if u.repo == repo and _is_production_unit(u) and not _is_trivial_production_unit(u)
-        and u.qualified_name.rsplit(".", 1)[-1] in stems
+        u for u in pool if u.qualified_name.rsplit(".", 1)[-1] in stems
     ]
     ranked = sorted(
         matches,
@@ -201,6 +221,7 @@ def resolve_production_units_for_ensure_tests(
     evidence_text: str = "",
     prep_kind: str = "",
     limit: int | None = None,
+    production_by_repo: dict[str, list[CodeUnit]] | None = None,
 ) -> list[CodeUnit]:
     """Map test/padding targets to concrete production FUNCTION/TYPE units."""
     resolved: list[CodeUnit] = []
@@ -214,6 +235,9 @@ def resolve_production_units_for_ensure_tests(
     pick_limit = limit if limit is not None else (
         _MOCK_ONLY_PRODUCTION_LIMIT if mock_only else _DEFAULT_PRODUCTION_LIMIT
     )
+    prod_index = production_by_repo if production_by_repo is not None else index_production_units_by_repo(
+        all_units
+    )
 
     def _add(unit: CodeUnit) -> None:
         if unit.id in seen or not _is_production_unit(unit) or _is_trivial_production_unit(unit):
@@ -225,7 +249,12 @@ def resolve_production_units_for_ensure_tests(
         for repo in {u.repo for u in target_units}:
             stems = _production_stems_from_mock_tests(repo, all_units)
             for prod in _units_for_mock_test_stems(
-                repo, stems, all_units, coverage=coverage, limit=pick_limit
+                repo,
+                stems,
+                all_units,
+                coverage=coverage,
+                limit=pick_limit,
+                production_by_repo=prod_index,
             ):
                 _add(prod)
 
@@ -240,25 +269,31 @@ def resolve_production_units_for_ensure_tests(
                 coverage=coverage,
                 padding_path=unit.path,
                 limit=pick_limit,
+                production_by_repo=prod_index,
             ):
                 _add(prod)
 
-    if evidence_lower:
-        for u in all_units:
-            if not _is_production_unit(u) or _is_trivial_production_unit(u):
-                continue
-            qn = u.qualified_name.lower()
-            simple = u.qualified_name.rsplit(".", 1)[-1].lower()
-            if qn in evidence_lower or (
-                len(simple) > 8 and simple in evidence_lower
-            ):
-                _add(u)
+    # Evidence scan: only production units in target repos (never full workspace × N).
+    if evidence_lower and len(resolved) < pick_limit:
+        repos = {u.repo for u in target_units}
+        for repo in repos:
+            for u in prod_index.get(repo) or []:
+                if len(resolved) >= pick_limit:
+                    break
+                qn = u.qualified_name.lower()
+                simple = u.qualified_name.rsplit(".", 1)[-1].lower()
+                if qn in evidence_lower or (len(simple) > 8 and simple in evidence_lower):
+                    _add(u)
 
     if not resolved:
         repos = {u.repo for u in target_units}
         for repo in repos:
             for prod in _pick_production_units(
-                repo, all_units, coverage=coverage, limit=pick_limit
+                repo,
+                all_units,
+                coverage=coverage,
+                limit=pick_limit,
+                production_by_repo=prod_index,
             ):
                 _add(prod)
 

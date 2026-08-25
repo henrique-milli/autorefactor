@@ -116,3 +116,91 @@ def test_get_changeset_enriches_targets(
     assert detail["ok"] is True
     assert detail["changeset"]["targets"][0]["source_snippet"]
     assert "risky_merge" in detail["changeset"]["targets"][0]["source_snippet"]
+
+
+def test_hitl_preserves_long_snippets_and_multi_target_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    long_a = "def handler_a():\n" + "\n".join(f"    step_a_{i}()" for i in range(60)) + "\n"
+    long_b = "def handler_b():\n" + "\n".join(f"    step_b_{i}()" for i in range(60)) + "\n"
+    long_c = "def handler_c():\n" + "\n".join(f"    step_c_{i}()" for i in range(60)) + "\n"
+    analyze = out / "analyze"
+    analyze.mkdir(parents=True, exist_ok=True)
+    (analyze / "units.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "u1",
+                    "repo": "r",
+                    "path": "a.py",
+                    "qualified_name": "handler_a",
+                    "kind": "function",
+                    "language": "python",
+                    "source_snippet": long_a,
+                    "content_hash": "a",
+                },
+                {
+                    "id": "u2",
+                    "repo": "r",
+                    "path": "b.py",
+                    "qualified_name": "handler_b",
+                    "kind": "function",
+                    "language": "python",
+                    "source_snippet": long_b,
+                    "content_hash": "b",
+                },
+                {
+                    "id": "u3",
+                    "repo": "r",
+                    "path": "c.py",
+                    "qualified_name": "handler_c",
+                    "kind": "function",
+                    "language": "python",
+                    "source_snippet": long_c,
+                    "content_hash": "c",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rationale = (
+        "These three handlers share the same control flow and exception mapping; "
+        "merging them would remove duplicated ADM ack paths across adapters. "
+    ) * 20
+    save_queue(
+        out,
+        [
+            Changeset(
+                id="hitl-long",
+                title="Merge similar handlers",
+                action="dedup",
+                brief="clone set",
+                rationale=rationale,
+                confidence=0.35,
+                metrics_delta={"kind": "near_duplicate"},
+                targets=[
+                    ChangesetTarget(repo="r", path="a.py", symbol="handler_a", unit_id="u1"),
+                    ChangesetTarget(repo="r", path="b.py", symbol="handler_b", unit_id="u2"),
+                    ChangesetTarget(repo="r", path="c.py", symbol="handler_c", unit_id="u3"),
+                ],
+            ),
+        ],
+    )
+    _patch_common(monkeypatch, tmp_path, out)
+
+    nxt = mcp_tools.tool_get_next_changeset()
+    review = nxt["hitl_review"]
+    assert review["targets"][0]["source_snippet"] == long_a
+    assert "step_a_59()" in review["targets"][0]["source_snippet"]
+    assert "step_b_59()" in review["targets"][1]["source_snippet"]
+    assert "step_c_59()" in review["targets"][2]["source_snippet"]
+    assert rationale.strip() == review["rationale"] or rationale[:4000].rstrip() in (
+        review["rationale"] or ""
+    )
+    digest = nxt["hitl_digest"]
+    assert "step_a_59()" in digest
+    assert "step_b_59()" in digest
+    assert "step_c_59()" in digest
+    assert digest.count("```") >= 6

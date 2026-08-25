@@ -16,6 +16,7 @@ from autorefactor.document.detect import find_document_gaps
 from autorefactor.testing.gaps import (
     is_coverage_padding_path,
     is_test_target_unit,
+    index_production_units_by_repo,
     resolve_mapper_caller_units,
     resolve_production_units_for_ensure_tests,
     unit_has_characterization_test,
@@ -166,6 +167,7 @@ def _remap_primary_ensure_tests(
 ) -> list[Changeset]:
     """Rewrite or drop primary ensure_tests that target padding / test paths."""
     units_by_id = {u.id: u for u in units}
+    production_by_repo = index_production_units_by_repo(units)
     out: list[Changeset] = []
     for cs in changesets:
         action = (cs.action or "").strip().lower()
@@ -197,6 +199,7 @@ def _remap_primary_ensure_tests(
             coverage=coverage,
             evidence_text=evidence,
             prep_kind=prep_kind,
+            production_by_repo=production_by_repo,
         )
         if draft:
             for u in target_units:
@@ -309,6 +312,7 @@ def _resolve_ensure_test_units(
     existing_tests: list[str] | None,
     coverage_threshold: float,
     coverage_pressure: bool = False,
+    production_by_repo: dict[str, list[CodeUnit]] | None = None,
 ) -> list[CodeUnit]:
     """Production-only ensure_tests targets; exclude padding/test paths."""
     cov_units: list[CodeUnit] = []
@@ -335,6 +339,7 @@ def _resolve_ensure_test_units(
                 coverage=coverage,
                 evidence_text=evidence,
                 prep_kind=str((parent.metrics_delta or {}).get("kind") or ""),
+                production_by_repo=production_by_repo,
             )
     elif coverage_pressure and not _coverage_is_estimated(coverage):
         evidence = " ".join(
@@ -346,6 +351,7 @@ def _resolve_ensure_test_units(
             coverage=coverage,
             evidence_text=evidence,
             prep_kind=str((parent.metrics_delta or {}).get("kind") or ""),
+            production_by_repo=production_by_repo,
         )
     elif _coverage_is_estimated(coverage) and (draft or coverage_pressure):
         evidence = " ".join(
@@ -357,6 +363,7 @@ def _resolve_ensure_test_units(
             coverage=coverage,
             evidence_text=evidence,
             prep_kind=str((parent.metrics_delta or {}).get("kind") or ""),
+            production_by_repo=production_by_repo,
         )
 
     # Draft-map silent-skip: always emit caller ensure_tests (even when coverage estimated).
@@ -378,6 +385,7 @@ def _resolve_ensure_test_units(
                 filter(None, [parent.rationale or "", parent.brief or "", parent.title or ""])
             ),
             prep_kind=str((parent.metrics_delta or {}).get("kind") or ""),
+            production_by_repo=production_by_repo,
         )
 
     seen: set[str] = set()
@@ -1238,6 +1246,7 @@ def attach_quality_followups(
         primary_ensure_unit_ids.update(t.unit_id for t in cs.targets if t.unit_id)
 
     units_by_id = {u.id: u for u in units}
+    production_by_repo = index_production_units_by_repo(units)
     if doc_gaps is None:
         # Only leaf-ish units that appear as targets
         target_units = []
@@ -1272,17 +1281,29 @@ def attach_quality_followups(
                 target_units.append(units_by_id[t.unit_id])
 
         doc_units = _file_scoped_doc_units([u for u in target_units if u.id in gaps_by_unit])
-        cov_units = _resolve_ensure_test_units(
-            target_units,
-            units,
-            coverage=coverage,
-            parent=cs,
-            existing_tests=existing_tests,
-            coverage_threshold=coverage_threshold,
-            coverage_pressure=coverage_pressure,
+        action_l = (cs.action or "").strip().lower()
+        # Empty coverage index: structural parents only keep a flag; skip O(units) resolve.
+        skip_cov_resolve = (
+            index_empty
+            and not _is_draft_map_parent(cs)
+            and not coverage_pressure
+            and action_l not in {"split", "extract_shared", "move"}
+        )
+        cov_units = (
+            []
+            if skip_cov_resolve
+            else _resolve_ensure_test_units(
+                target_units,
+                units,
+                coverage=coverage,
+                parent=cs,
+                existing_tests=existing_tests,
+                coverage_threshold=coverage_threshold,
+                coverage_pressure=coverage_pressure,
+                production_by_repo=production_by_repo,
+            )
         )
         if index_empty and not _is_draft_map_parent(cs) and not coverage_pressure:
-            action_l = (cs.action or "").strip().lower()
             if action_l not in {"split", "extract_shared", "move"}:
                 cov_units = []
         if primary_ensure_unit_ids:

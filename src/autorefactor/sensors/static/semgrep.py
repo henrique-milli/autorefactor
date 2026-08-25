@@ -41,7 +41,22 @@ class SemgrepAnalyzer:
         return out
 
     def analyze(self, ctx: AnalyzerContext) -> list[Finding]:
+        n_units = len(ctx.units)
+        n_repos = len(ctx.repos)
+        # Large multi-repo trees: full rule packs × every repo can exceed hours and
+        # starve the job heartbeats (orphaned). Skip external semgrep; structural
+        # sensors already cover the cross-repo signal the user cares about.
+        large = n_units >= 4000 or n_repos >= 8
+        if large:
+            ctx.note(
+                self.name,
+                "skip",
+                f"skipped on large workspace ({n_repos} repos, {n_units} units); "
+                "re-run with focus on a single repo for semgrep",
+            )
+            return []
         configs = self._configs_for(ctx)
+        per_repo_timeout = 300
         flags: list[Finding] = []
         for repo in ctx.repos:
             cmd = ["semgrep", "--json", "--quiet"]
@@ -54,7 +69,7 @@ class SemgrepAnalyzer:
                     capture_output=True,
                     text=True,
                     check=False,
-                    timeout=300,
+                    timeout=per_repo_timeout,
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
                 ctx.note(self.name, "error", str(exc))

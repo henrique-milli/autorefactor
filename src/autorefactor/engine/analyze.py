@@ -198,7 +198,22 @@ def run_analyze(
     )
     report("sensors", 65, "fingerprint + embeddings + smells")
     console.print("[bold]Running sensors...[/bold]")
-    raw_findings, sensor_reports = run_sensors(ctx, concurrency=config.describe_concurrency)
+
+    def _sensor_progress(sensor_id: str, done: int, total: int) -> None:
+        frac = done / max(total, 1)
+        report(
+            "sensors",
+            65 + (10 * frac),
+            f"sensor {done}/{total}: {sensor_id}",
+        )
+
+    raw_findings, sensor_reports = run_sensors(
+        ctx,
+        # Large workspaces: serialize sensors so progress heartbeats advance and
+        # GIL fights between CPU-bound sensors don't stretch wall time.
+        concurrency=1 if len(units) >= 4000 else config.describe_concurrency,
+        on_progress=_sensor_progress,
+    )
     findings, rejected = validate_findings(raw_findings, ctx.known_ids())
     before_collapse = len(findings)
     findings = collapse_findings_by_unit_set(findings)

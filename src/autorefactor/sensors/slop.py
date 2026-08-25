@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections import Counter, defaultdict
 
 from pathlib import Path
 
+from autorefactor.config import IGNORE_DIR_NAMES
 from autorefactor.domain import (
     AnalysisGoal,
     CodeUnit,
@@ -32,8 +34,9 @@ _EMPTY_CATCH = re.compile(
     r"catch\s*\([^)]*\)\s*\{\s*\}|except\s+(\w+\s*)?:\s*(pass|continue)\b",
     re.IGNORECASE,
 )
+# Bound the gap between TODO/draft and Map — unbounded ``.*`` + DOTALL ReDoS's on large files.
 _DRAFT_MAP = re.compile(
-    r"\b(TODO|FIXME|draft)\b.*\b(Map|HashMap)\b|\bdefaultMappings\s*=\s*new\s+HashMap",
+    r"\b(TODO|FIXME|draft)\b.{0,240}\b(Map|HashMap)\b|\bdefaultMappings\s*=\s*new\s+HashMap",
     re.IGNORECASE | re.DOTALL,
 )
 _DISABLED_HOOK = re.compile(
@@ -52,75 +55,103 @@ _NORM_CALLER = re.compile(
 )
 
 
+# Python identity helpers: keep the gap between ``def`` and ``return`` tiny.
+# The old ``(?:[^\n]*\n\s*)*`` form ReDoS's on nested defs (e.g. smoke tests with
+# ``def fake_*`` inside ``main``) — never use unbounded line loops here.
+_PY_IDENTITY_ONELINE = re.compile(
+    r"def\s+(\w+)\(\s*(\w+)\s*(?:,[^)\n]*)?\):\s*return\s+\2\b",
+)
+_PY_IDENTITY_SHORT = re.compile(
+    r"def\s+(\w+)\(\s*(\w+)\s*(?:,[^)\n]*)?\):\s*(?:#.*)?\n"
+    r"(?:[ \t]*\n){0,2}"
+    r"[ \t]+return\s+\2\b",
+)
+_GO_IDENTITY = re.compile(
+    r"func\s+(\w+)\((\w+)\s+\w+\)\s+\w+\s*\{\s*return\s+\2\s*\}",
+)
+
+
 def _identity_helpers_in_source(snippet: str, language: str) -> list[tuple[str, str]]:
     """Find helper names whose body is a bare identity return."""
     out: list[tuple[str, str]] = []
     if language == "go":
-        for m in re.finditer(
-            r"func\s+(\w+)\((\w+)\s+\w+\)\s+\w+\s*\{\s*return\s+\2\s*\}",
-            snippet,
-            re.DOTALL,
-        ):
+        for m in _GO_IDENTITY.finditer(snippet):
             out.append((m.group(1), m.group(2)))
     elif language == "python":
-        for m in re.finditer(
-            r"def\s+(\w+)\(\s*(\w+)\s*[^)]*\):\s*(?:[^\n]*\n\s*)*return\s+\2\s*$",
-            snippet,
-            re.MULTILINE,
-        ):
-            out.append((m.group(1), m.group(2)))
+        seen: set[str] = set()
+        for pat in (_PY_IDENTITY_ONELINE, _PY_IDENTITY_SHORT):
+            for m in pat.finditer(snippet):
+                key = m.group(1)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append((m.group(1), m.group(2)))
     return out
 
 
 def _collect_identity_findings(ctx: AnalysisContext, known: set[str]) -> list[Finding]:
     findings: list[Finding] = []
     seen: set[str] = set()
+    by_path: dict[tuple[str, str], list[CodeUnit]] = defaultdict(list)
     for unit in ctx.units_list():
-        if unit.kind != UnitKind.FUNCTION or is_test_path(unit.path):
-            continue
-        snippet = unit.source_snippet or ""
-        for helper, _param in _identity_helpers_in_source(snippet, unit.language):
-            key = f"{unit.path}:{helper}"
-            if key in seen:
-                continue
-            seen.add(key)
-            file_units = [
-                u
-                for u in ctx.units_list()
-                if u.path == unit.path and u.kind == UnitKind.FUNCTION
-            ]
-            callers = [
-                u
-                for u in file_units
-                if helper in (u.source_snippet or "") and simple_name(u.qualified_name) != helper
-            ]
-            norm_context = _NORM_CALLER.search(snippet) or any(
-                _NORM_CALLER.search(u.source_snippet or "") for u in file_units
-            )
-            if not norm_context:
-                continue
-            caller_names = [simple_name(u.qualified_name) for u in callers[:3]]
-            ref = caller_names[0] if caller_names else simple_name(unit.qualified_name)
-            anchor = callers[0].id if callers else unit.id
-            f = try_make_finding(
-                id=content_hash(f"slop:identity:{unit.repo}:{unit.path}:{helper}"),
-                goal=AnalysisGoal.SLOP,
-                sensor="slop",
-                severity=Severity.HIGH,
-                title=f"No-op helper `{helper}` breaks parity (used by `{ref}`)",
-                evidence=(
-                    f"`{helper}` is an identity return while sibling languages trim/lowercase; "
-                    f"caller(s): {', '.join(caller_names) or ref}."
-                ),
-                unit_ids=[anchor, unit.id][:4],
-                action_hint=SuggestedAction.DELETE_DUPLICATE,
-                score=0.87,
-                metadata={"helper": helper, "callers": caller_names},
-                known_ids=known,
-            )
-            if f:
-                findings.append(f)
+        if unit.kind == UnitKind.FUNCTION and not is_test_path(unit.path):
+            by_path[(unit.repo, unit.path)].append(unit)
+
+    for (_repo, _path), file_units in by_path.items():
+        for unit in file_units:
+            snippet = unit.source_snippet or ""
+            for helper, _param in _identity_helpers_in_source(snippet, unit.language):
+                key = f"{unit.path}:{helper}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                callers = [
+                    u
+                    for u in file_units
+                    if helper in (u.source_snippet or "")
+                    and simple_name(u.qualified_name) != helper
+                ]
+                norm_context = _NORM_CALLER.search(snippet) or any(
+                    _NORM_CALLER.search(u.source_snippet or "") for u in file_units
+                )
+                if not norm_context:
+                    continue
+                caller_names = [simple_name(u.qualified_name) for u in callers[:3]]
+                ref = caller_names[0] if caller_names else simple_name(unit.qualified_name)
+                anchor = callers[0].id if callers else unit.id
+                f = try_make_finding(
+                    id=content_hash(f"slop:identity:{unit.repo}:{unit.path}:{helper}"),
+                    goal=AnalysisGoal.SLOP,
+                    sensor="slop",
+                    severity=Severity.HIGH,
+                    title=f"No-op helper `{helper}` breaks parity (used by `{ref}`)",
+                    evidence=(
+                        f"`{helper}` is an identity return while sibling languages trim/lowercase; "
+                        f"caller(s): {', '.join(caller_names) or ref}."
+                    ),
+                    unit_ids=[anchor, unit.id][:4],
+                    action_hint=SuggestedAction.DELETE_DUPLICATE,
+                    score=0.87,
+                    metadata={"helper": helper, "callers": caller_names},
+                    known_ids=known,
+                )
+                if f:
+                    findings.append(f)
     return findings
+
+
+def _iter_src_main_java(repo: Path):
+    """Yield ``*.java`` under ``src/main`` only, pruning ignored build dirs."""
+    for main in repo.glob("**/src/main"):
+        # Skip anything under target/build/node_modules even if named src/main.
+        parts = set(main.parts)
+        if parts & IGNORE_DIR_NAMES:
+            continue
+        for dirpath, dirnames, filenames in os.walk(main):
+            dirnames[:] = [d for d in dirnames if d not in IGNORE_DIR_NAMES and not d.startswith(".")]
+            for name in filenames:
+                if name.endswith(".java"):
+                    yield Path(dirpath) / name
 
 
 def _read_text(path: Path, limit: int = 500_000) -> str:
@@ -192,9 +223,9 @@ def _collect_draft_map_findings(ctx: AnalysisContext, known: set[str]) -> list[F
             findings.append(f)
 
     for repo in ctx.repos:
-        for path in repo.rglob("*.java"):
+        for path in _iter_src_main_java(repo):
             rel = str(path.relative_to(repo)).replace("\\", "/")
-            if "src/main/" not in rel or "src/test/" in rel:
+            if "src/test/" in rel:
                 continue
             file_key = _draft_map_file_key(repo.name, rel)
             if file_key in seen_files:
@@ -269,9 +300,9 @@ def _collect_disabled_validation_findings(ctx: AnalysisContext, known: set[str])
             findings.append(f)
 
     for repo in ctx.repos:
-        for path in repo.rglob("*.java"):
+        for path in _iter_src_main_java(repo):
             rel = str(path.relative_to(repo)).replace("\\", "/")
-            if "src/main/" not in rel or not _is_config_validator_path(rel):
+            if not _is_config_validator_path(rel):
                 continue
             file_key = f"{repo.name}:{rel}"
             if file_key in seen_files:
@@ -354,10 +385,14 @@ class SlopSensor:
             return True
 
         pairs = candidate_pairs(fps, min_shared=2)
+        # Cap before expensive domain-token divergence checks on large workspaces.
+        pairs = [(a, b, s) for a, b, s in pairs if s >= 0.70 and a in by_id and b in by_id]
+        pairs.sort(key=lambda t: -t[2])
+        pairs = pairs[: max(2000, int(getattr(ctx.config, "max_fingerprint_pairs", None) or 80) * 40)]
         pairs = [
             (a, b, s)
             for a, b, s in pairs
-            if s >= 0.70 and a in by_id and b in by_id and _pair_is_slop_signal(a, b, s)
+            if _pair_is_slop_signal(a, b, s)
         ]
 
         parent = {uid: uid for uid in fps}

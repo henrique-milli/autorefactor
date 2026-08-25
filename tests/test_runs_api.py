@@ -142,7 +142,7 @@ def test_templates() -> None:
     assert "presets" not in data
 
 
-def test_units_light_truncates_and_joins_changeset_targets(
+def test_units_light_preserves_full_snippets_and_joins_changeset_targets(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setattr(runs_api, "autorefactor_home", lambda: tmp_path)
@@ -202,9 +202,8 @@ def test_units_light_truncates_and_joins_changeset_targets(
     assert units is not None and len(units) == 1
     snippet = units[0]["source_snippet"]
     assert snippet.startswith("line 0")
-    assert snippet.count("\n") < 40
-    assert len(snippet) <= 1200
-    assert "line 79" not in snippet
+    assert "line 79" in snippet
+    assert snippet == long_src
 
     changesets = runs_api.load_changesets("snip-run")
     assert changesets and changesets[0]["targets"][0]["source_snippet"] == snippet

@@ -1086,8 +1086,26 @@ def tool_get_next_changeset(
         needs_confirmation = False
         hitl_reason = None
     auto_proceed = (not needs_confirmation) and not waiting
-    enriched_targets = enrich_targets(out_dir, cs.targets or [])
-    digest = _hitl_digest(cs, threshold, enriched_targets=enriched_targets)
+    # Autorun must stay lean — full MAX_SOURCE_CHARS snippets in digests time out MCP
+    # on large multi-repo queues. Reserve full enrich for HITL confirmation only.
+    if needs_confirmation or waiting:
+        enriched_targets = enrich_targets(out_dir, cs.targets or [])
+        digest = _hitl_digest(cs, threshold, enriched_targets=enriched_targets)
+    else:
+        enriched_targets = [
+            {
+                "repo": getattr(t, "repo", None) if not isinstance(t, dict) else t.get("repo"),
+                "path": getattr(t, "path", None) if not isinstance(t, dict) else t.get("path"),
+                "symbol": getattr(t, "symbol", None) if not isinstance(t, dict) else t.get("symbol"),
+                "unit_id": getattr(t, "unit_id", None) if not isinstance(t, dict) else t.get("unit_id"),
+                "qualified_name": getattr(t, "qualified_name", None)
+                if not isinstance(t, dict)
+                else t.get("qualified_name"),
+                "source_snippet": "",
+            }
+            for t in (cs.targets or [])
+        ]
+        digest = _hitl_digest(cs, threshold, enriched_targets=enriched_targets)
     if unresolved:
         paths_note = ", ".join(f"`{p}`" for p in target_paths) or "(no targets)"
         digest += f"\nunits_unresolved: no index units match targets {paths_note}"
@@ -1282,7 +1300,7 @@ def _hitl_review(
 ) -> dict[str, Any]:
     from autorefactor.report.roi import changeset_why, plain_english_upside, upside_kind
 
-    why = changeset_why(cs, max_chars=320)
+    why = changeset_why(cs, max_chars=4000)
     benefit = plain_english_upside(cs)
     kind = upside_kind(cs)
     finding_kind = str((cs.metrics_delta or {}).get("kind") or "") or None

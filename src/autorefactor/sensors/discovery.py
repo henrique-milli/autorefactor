@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable
 from importlib.metadata import entry_points
 
 from autorefactor.config import STATIC_SENSOR_IDS
@@ -88,7 +89,12 @@ def enabled_sensor_ids(config_sensors: str, registry: dict[str, Sensor]) -> list
     return list(dict.fromkeys(out)) if out else sorted(registry.keys())
 
 
-def run_sensors(ctx: AnalysisContext, *, concurrency: int = 8) -> tuple[list[Finding], list[SensorReport]]:
+def run_sensors(
+    ctx: AnalysisContext,
+    *,
+    concurrency: int = 8,
+    on_progress: Callable[[str, int, int], None] | None = None,
+) -> tuple[list[Finding], list[SensorReport]]:
     registry = discover_sensors()
     names = enabled_sensor_ids(ctx.config.enabled_sensors(), registry)
     allowed_goals = FOCUS_GOALS.get(ctx.focus, FOCUS_GOALS["balanced"])
@@ -134,12 +140,28 @@ def run_sensors(ctx: AnalysisContext, *, concurrency: int = 8) -> tuple[list[Fin
 
     findings: list[Finding] = []
     reports: list[SensorReport] = []
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-        futs = [pool.submit(_run_one, n) for n in names]
-        for fut in as_completed(futs):
-            result = fut.result()
+    total = len(names)
+    # Large workspaces: run sensors one-by-one (clearer progress, no GIL pile-up).
+    if max(1, concurrency) == 1:
+        for done_idx, name in enumerate(names, start=1):
+            if on_progress is not None:
+                on_progress(f"start:{name}", done_idx - 1, total)
+            result = _run_one(name)
             findings.extend(result.findings)
             reports.append(result.report)
+            if on_progress is not None:
+                on_progress(result.report.sensor, done_idx, total)
+    else:
+        done = 0
+        with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+            futs = {pool.submit(_run_one, n): n for n in names}
+            for fut in as_completed(futs):
+                result = fut.result()
+                findings.extend(result.findings)
+                reports.append(result.report)
+                done += 1
+                if on_progress is not None:
+                    on_progress(result.report.sensor, done, total)
 
     # Hint packs
     hint_ids = [

@@ -1,23 +1,25 @@
-"""Shared source snippet truncation and changeset target enrichment."""
+"""Shared source snippet helpers and changeset target enrichment."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
-_SNIPPET_MAX_LINES = 40
-_SNIPPET_MAX_CHARS = 1200
+from autorefactor.config import MAX_SOURCE_CHARS
 
 
 def truncate_source_snippet(text: str | None) -> str:
+    """Return the full snippet for review surfaces.
+
+    Extract already caps stored units at ``MAX_SOURCE_CHARS``; this only
+    re-applies that ceiling as a safety bound (no tighter clip).
+    """
     raw = text or ""
     if not raw:
         return ""
-    lines = raw.splitlines()
-    clipped = "\n".join(lines[:_SNIPPET_MAX_LINES])
-    if len(clipped) > _SNIPPET_MAX_CHARS:
-        clipped = clipped[:_SNIPPET_MAX_CHARS]
-    return clipped
+    if len(raw) > MAX_SOURCE_CHARS:
+        return raw[:MAX_SOURCE_CHARS]
+    return raw
 
 
 def _target_fields(target: Any) -> dict[str, Any]:
@@ -52,7 +54,7 @@ def _resolve_unit_for_target(target: Any, units: list[Any]) -> Any | None:
 
 
 def enrich_targets(out_dir: Path, targets: list[Any] | None) -> list[dict[str, Any]]:
-    """Resolve targets against index units and attach truncated source snippets."""
+    """Resolve targets against index units and attach full source snippets."""
     if not targets:
         return []
     from autorefactor.artifacts import layout_for, load_units
@@ -79,7 +81,7 @@ def enrich_targets_from_snippet_map(
     targets: list[Any] | None,
     snippet_by_id: dict[str, str],
 ) -> list[dict[str, Any]]:
-    """Join pre-loaded truncated snippets onto target dicts (HTTP UI path)."""
+    """Join pre-loaded source snippets onto target dicts (HTTP UI path)."""
     if not targets:
         return []
     out: list[dict[str, Any]] = []
@@ -97,7 +99,7 @@ def enrich_targets_from_snippet_map(
     return out
 
 
-def snippet_blocks_for_digest(enriched_targets: list[dict[str, Any]], *, max_targets: int = 2) -> str:
+def snippet_blocks_for_digest(enriched_targets: list[dict[str, Any]], *, max_targets: int = 8) -> str:
     """Markdown fenced code blocks for up to ``max_targets`` snippets."""
     blocks: list[str] = []
     for target in enriched_targets[:max_targets]:
