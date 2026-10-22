@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -257,3 +258,94 @@ def test_export_active_and_extract_roundtrip(tmp_path: Path, monkeypatch) -> Non
     written2 = extract_tar_gz_into(bytes(subset), dest2)
     assert written2 == ["src/a.py"]
     assert not (dest2 / "dirty.txt").exists()
+
+
+# ---------------------------------------------------------------- secret floor
+
+
+def _git(root: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=True,
+        capture_output=True,
+        env={"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"},
+    )
+
+
+def _make_repo(root: Path) -> None:
+    root.mkdir(parents=True)
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "test@example.com")
+    _git(root, "config", "user.name", "test")
+
+
+def test_secret_named_files_never_upload(tmp_path: Path) -> None:
+    """A non-git workspace must still never upload credentials.
+
+    `hmd` is 10 nested repos under one non-repo root: `git ls-files` fails at
+    the top level and the walk takes over. Secret names are the floor there.
+    """
+    src = tmp_path / "ws"
+    (src / "src").mkdir(parents=True)
+    (src / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+    for secret in (".env", ".env.local", ".env.staging", ".credentials.local",
+                   "id_ed25519", "server.pem", "tls.key"):
+        (src / secret).write_text("SECRET\n", encoding="utf-8")
+    (src / ".env.example").write_text("TEMPLATE=\n", encoding="utf-8")
+
+    files = list_workspace_files(src)
+    assert "src/app.py" in files
+    assert ".env.example" in files, "templates are not secrets"
+    for secret in (".env", ".env.local", ".env.staging", ".credentials.local",
+                   "id_ed25519", "server.pem", "tls.key"):
+        assert secret not in files, f"{secret} must not be uploaded"
+
+
+def test_nested_repos_honor_their_own_gitignore(tmp_path: Path) -> None:
+    """Each nested repo's .gitignore applies even though the parent is not a repo."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "README.md").write_text("top\n", encoding="utf-8")
+
+    nested = ws / "app"
+    _make_repo(nested)
+    (nested / "keep.py").write_text("keep\n", encoding="utf-8")
+    (nested / "ignore_me.txt").write_text("no\n", encoding="utf-8")
+    (nested / ".gitignore").write_text("ignore_me.txt\n.env\n", encoding="utf-8")
+    (nested / ".env").write_text("SECRET\n", encoding="utf-8")
+    _git(nested, "add", "-A")
+
+    files = list_workspace_files(ws)
+    assert "README.md" in files
+    assert "app/keep.py" in files, "nested repo contents must still upload"
+    assert "app/ignore_me.txt" not in files, "nested .gitignore must be honored"
+    assert "app/.env" not in files, "secret floor applies inside nested repos too"
+
+
+def test_walk_captures_nested_repo_contents(tmp_path: Path) -> None:
+    """Regression: git-treating nested repos as opaque dirs uploaded ~2 files."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    nested = ws / "app"
+    _make_repo(nested)
+    (nested / "src").mkdir()
+    (nested / "src" / "mod.py").write_text("def f(): pass\n", encoding="utf-8")
+    _git(nested, "add", "-A")
+
+    files = list_workspace_files(ws)
+    assert "app/src/mod.py" in files
+    assert len(files) >= 1
+
+
+def test_repo_root_still_uses_git_list(tmp_path: Path) -> None:
+    """A plain single-repo workspace keeps honoring its .gitignore."""
+    repo = tmp_path / "repo"
+    _make_repo(repo)
+    (repo / "keep.py").write_text("keep\n", encoding="utf-8")
+    (repo / "secret.env").write_text("no\n", encoding="utf-8")
+    (repo / ".gitignore").write_text("secret.env\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+
+    files = list_workspace_files(repo)
+    assert "keep.py" in files
+    assert "secret.env" not in files

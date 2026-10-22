@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -242,6 +243,44 @@ def _git_files(root: Path) -> list[str] | None:
     return items
 
 
+# Secret-bearing filenames are never uploaded, regardless of git state or rules.
+# A workspace that is not a git repo has no .gitignore to honor, so these are the
+# floor. `hmd` is such a workspace: 10 nested repos under one non-repo root.
+_SECRET_NAME_RE = re.compile(
+    r"^\.env(\..+)?$"
+    r"|\.credentials(\.local)?$"
+    r"|.*\.(pem|key|p12|pfx)$"
+    r"|^id_(rsa|ed25519|ecdsa|dsa).*"
+)
+
+# Placeholder templates are documentation, not secrets. Allow these by exact
+# name so a real `.env.local` is still blocked while `.env.example` ships.
+_SECRET_NAME_ALLOW = frozenset(
+    {
+        ".env.example",
+        ".env.sample",
+        ".env.template",
+        ".env.test",
+        ".env.local.example",
+        ".credentials.local.example",
+    }
+)
+
+
+def _is_secret_name(name: str) -> bool:
+    if name in _SECRET_NAME_ALLOW:
+        return False
+    return bool(_SECRET_NAME_RE.match(name))
+
+
+def _is_git_worktree(path: Path) -> bool:
+    """A repo root: .git dir (normal) or .git file (worktree / submodule)."""
+    try:
+        return (path / ".git").exists()
+    except OSError:
+        return False
+
+
 _SKIP_DIR_NAMES = frozenset(
     {
         ".git",
@@ -266,14 +305,67 @@ _SKIP_DIR_NAMES = frozenset(
 
 
 def _walk_files(root: Path) -> list[str]:
-    """Walk files under root, following directory symlinks (for eval symlink mode)."""
+    """Walk files under root, following directory symlinks (for eval symlink mode).
+
+    A workspace that is not a git repo still contains nested repos (e.g. `hmd`
+    is 10 sibling clones under one non-repo root). Each nested repo has its own
+    `.gitignore`, so on entering one we delegate to `git ls-files` and honor
+    that repo's rules instead of raw-walking it. Secret-named files are dropped
+    everywhere, git or not.
+    """
     out: list[str] = []
     root = root.resolve()
+
+    def take(repo_root: Path, rel_prefix: str) -> None:
+        """Walk one directory tree, pruning skipped dirs and secret names."""
+        for dirpath, dirnames, filenames in os.walk(repo_root, followlinks=True):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIR_NAMES]
+            base = Path(dirpath)
+            for name in filenames:
+                if _is_secret_name(name):
+                    continue
+                path = base / name
+                if not path.is_file():
+                    continue
+                try:
+                    rel = path.relative_to(repo_root)
+                except ValueError:
+                    continue
+                if any(part in _SKIP_DIR_NAMES for part in rel.parts):
+                    continue
+                out.append((rel_prefix + str(rel)).replace("\\", "/"))
+
+    # Root may itself be a git worktree: honor its .gitignore via git ls-files.
+    if _is_git_worktree(root):
+        listed = _git_files(root)
+        if listed is not None:
+            return [p for p in listed if not _is_secret_name(Path(p).name)]
+        # git unavailable: fall through to walking, with the secret floor.
+
     for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
-        # Prune skipped directory names in-place
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIR_NAMES]
         base = Path(dirpath)
+
+        # Nested repos delegate to their own gitignore rather than raw walking.
+        for d in list(dirnames):
+            sub = base / d
+            if not _is_git_worktree(sub):
+                continue
+            dirnames.remove(d)  # do not walk into it twice
+            rel_prefix = str(sub.relative_to(root)).replace("\\", "/") + "/"
+            listed = _git_files(sub)
+            if listed is not None:
+                out.extend(
+                    rel_prefix + p
+                    for p in listed
+                    if not _is_secret_name(Path(p).name)
+                )
+            else:
+                take(sub, rel_prefix)
+
         for name in filenames:
+            if _is_secret_name(name):
+                continue
             path = base / name
             if not path.is_file():
                 continue
@@ -284,6 +376,7 @@ def _walk_files(root: Path) -> list[str]:
             if any(part in _SKIP_DIR_NAMES for part in rel.parts):
                 continue
             out.append(str(rel).replace("\\", "/"))
+
     return out
 
 
