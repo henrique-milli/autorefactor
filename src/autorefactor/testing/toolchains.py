@@ -53,14 +53,19 @@ def coverage_augmented_command(base_cmd: str, repos: list[Path]) -> str:
             base_cmd.replace("pytest", "coverage run -m pytest", 1)
             + " && coverage json -o coverage.json"
         )
+    # pnpm FIRST: "npm test" is a substring of "pnpm test" and would mis-fire.
+    if "pnpm test" in base_cmd and "c8" not in base_cmd:
+        return base_cmd.replace(
+            "pnpm test",
+            "pnpm exec c8 --reporter=json --reporter=text pnpm test",
+            1,
+        )
     if "npm test" in base_cmd and "c8" not in base_cmd and shutil.which("npx"):
         return base_cmd.replace(
             "npm test",
             "npx --yes c8 --reporter=json-summary --reporter=json npm test",
             1,
         )
-    if "pnpm test" in base_cmd and "c8" not in base_cmd:
-        return base_cmd.replace("pnpm test", "pnpm exec c8 --reporter=json npm test", 1)
     if "mvn" in base_cmd and "jacoco" not in base_cmd:
         return base_cmd + " jacoco:report"
     return base_cmd

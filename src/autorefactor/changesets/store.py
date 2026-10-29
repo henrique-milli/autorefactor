@@ -33,7 +33,16 @@ _WIRING_HANDLER_FROM_TITLE = re.compile(r"handler `(\w+)\.(\w+)`", re.IGNORECASE
 _WIRING_HANDLER_FROM_EVIDENCE = re.compile(r"`(\w+)\.(\w+)`")
 _DEFAULT_AUTORUN_THRESHOLD = 0.6
 _AUTORUN_BLOCKED_KINDS = frozenset(
-    {"committed_secret", "disabled_startup_validation", "draft_in_memory_map"}
+    {
+        "committed_secret",
+        "disabled_startup_validation",
+        "draft_in_memory_map",
+        "untyped_supabase_response",
+    }
+)
+# Security findings that must never auto-proceed (secrets + unsafe Supabase access).
+_SECURITY_SENSITIVE_KINDS = frozenset(
+    {"committed_secret", "missing_rls", "permissive_rls_policy", "service_role_in_client"}
 )
 
 
@@ -159,9 +168,9 @@ def _behavior_sensitive_band_hitl(changeset: Changeset, min_confidence: float) -
 
 
 def security_sensitive_hitl(changeset: Changeset) -> bool:
-    """Committed secrets/credentials must never auto_proceed."""
+    """Committed secrets/credentials and unsafe access policies must never auto_proceed."""
     kind = str((changeset.metrics_delta or {}).get("kind") or "").lower()
-    if kind == "committed_secret":
+    if kind in _SECURITY_SENSITIVE_KINDS:
         return True
     blob = _changeset_text_blob(changeset).lower()
     if "committed_secret" in blob or "committed credential" in blob:
@@ -481,9 +490,10 @@ def hitl_questions_for_reason(
         ]
     if reason == "security_sensitive":
         return [
-            "Security-sensitive finding (committed secret/credential) — never auto_proceed.",
+            "Security-sensitive finding (committed secret or unsafe access policy) — never auto_proceed.",
             f"Proceed with '{changeset.title}' ({changeset.action}) only after confirming "
-            "secret rotation and externalization via env/vault.",
+            "the fix (rotate/externalize secrets; tighten RLS predicates; keep service-role "
+            "keys server-side).",
             "Reply yes to continue, skip to skip, or blocked.",
         ]
     if reason == "slop_sensitive":

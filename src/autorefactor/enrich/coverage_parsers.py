@@ -83,6 +83,73 @@ def parse_istanbul_json(path: Path) -> CoverageSnapshot:
     )
 
 
+def parse_lcov_info(path: Path) -> CoverageSnapshot:
+    """Parse an lcov.info report (vitest/jest --coverage reporter=lcov)."""
+    files: list[CoverageFileStat] = []
+    current_path: str | None = None
+    current_lf = 0
+    current_lh = 0
+
+    def flush() -> None:
+        nonlocal current_path, current_lf, current_lh
+        if current_path and current_lf > 0:
+            percent = (100.0 * current_lh / current_lf) if current_lf else 0.0
+            files.append(
+                CoverageFileStat(
+                    path=current_path,
+                    covered_lines=current_lh,
+                    total_lines=current_lf,
+                    percent=percent,
+                )
+            )
+        current_path = None
+        current_lf = 0
+        current_lh = 0
+
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    for line in text.splitlines():
+        if line.startswith("SF:"):
+            flush()
+            current_path = _shorten_report_path(line[3:].strip().replace("\\", "/"))
+        elif line.startswith("LF:"):
+            try:
+                current_lf = int(line[3:].strip())
+            except ValueError:
+                current_lf = 0
+        elif line.startswith("LH:"):
+            try:
+                current_lh = int(line[3:].strip())
+            except ValueError:
+                current_lh = 0
+        elif line.startswith("end_of_record"):
+            flush()
+    flush()
+
+    covered = sum(f.covered_lines for f in files)
+    total = sum(f.total_lines for f in files)
+    overall = (100.0 * covered / total) if total else None
+    return CoverageSnapshot(
+        summary=f"lcov report from {path.name}",
+        overall_percent=overall,
+        files=files,
+        source="lcov",
+    )
+
+
+def _shorten_report_path(path: str) -> str:
+    """Reduce absolute report paths to repo-relative form when a source root is present."""
+    if not path.startswith("/"):
+        return path
+    best = -1
+    for marker in ("/packages/", "/apps/", "/src/", "/app/", "/lib/", "/components/"):
+        idx = path.find(marker)
+        if idx != -1 and (best == -1 or idx < best):
+            best = idx
+    if best != -1:
+        return path[best + 1 :]
+    return path
+
+
 def _jacoco_local_tag(tag: str) -> str:
     return tag.rsplit("}", 1)[-1] if "}" in tag else tag
 
@@ -181,6 +248,7 @@ def discover_coverage_reports(workspace: Path, repos: list[Path]) -> list[Path]:
         "coverage.json",
         "coverage/coverage-final.json",
         "coverage/coverage.json",
+        "coverage/lcov.info",
         "target/site/jacoco/jacoco.xml",
         "build/reports/jacoco/test/jacocoTestReport.xml",
     ]
@@ -190,10 +258,16 @@ def discover_coverage_reports(workspace: Path, repos: list[Path]) -> list[Path]:
             path = root / pattern
             if path.exists() and not _is_maven_target_coverage_json(path):
                 candidates.append(path)
+        # Bounded-depth lcov discovery (vitest/jest monorepo outputs) — no node_modules walks.
+        for pattern in ("*/coverage/lcov.info", "*/*/coverage/lcov.info"):
+            for path in root.glob(pattern):
+                if "node_modules" in path.parts:
+                    continue
+                candidates.append(path)
         for pattern in _JACOCO_GLOBS:
             candidates.extend(root.glob(pattern))
         for path in root.glob("**/coverage.json"):
-            if _is_maven_target_coverage_json(path):
+            if _is_maven_target_coverage_json(path) or "node_modules" in path.parts:
                 continue
             candidates.append(path)
     # de-dupe
@@ -221,6 +295,8 @@ def _repo_for_report(report: Path, repos: list[Path]) -> str | None:
 def _parse_one_report(report: Path) -> CoverageSnapshot | None:
     name = report.name.lower()
     try:
+        if name == "lcov.info":
+            return parse_lcov_info(report)
         if name.endswith(".json") and "coverage" in str(report).lower():
             text = report.read_text(encoding="utf-8", errors="ignore")[:200]
             if '"statementMap"' in text or '"s":' in text:

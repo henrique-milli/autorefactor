@@ -23,6 +23,11 @@ class UnitKind(str, Enum):
     PROTO_MESSAGE = "proto_message"
     PROTO_RPC = "proto_rpc"
     PROTO_SERVICE = "proto_service"
+    SQL_TABLE = "sql_table"
+    SQL_POLICY = "sql_policy"
+    SQL_FUNCTION = "sql_function"
+    SQL_TRIGGER = "sql_trigger"
+    SQL_INDEX = "sql_index"
 
 
 class AnalysisGoal(str, Enum):

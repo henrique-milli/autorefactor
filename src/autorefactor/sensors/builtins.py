@@ -13,6 +13,7 @@ from autorefactor.sensors.static_adapters import (
     SemgrepSensor,
 )
 from autorefactor.sensors.structure import StructureSensor
+from autorefactor.sensors.supabase import SupabaseSensor
 from autorefactor.sensors.test_quality import TestQualitySensor
 from autorefactor.sensors.wiring import WiringSensor
 
@@ -31,6 +32,7 @@ def builtin_sensors():
         ContractSensor(),
         ClusterSensor(),
         WiringSensor(),
+        SupabaseSensor(),
         SemgrepSensor(),
         RuffSensor(),
         EslintSensor(),
@@ -85,6 +87,10 @@ def cluster():
 
 def wiring():
     return WiringSensor()
+
+
+def supabase():
+    return SupabaseSensor()
 
 
 def static_semgrep():

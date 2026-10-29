@@ -86,7 +86,10 @@ def coverage_tool_configured(repo: Path) -> bool:
         return "jacoco" in text
 
     def _text_has_js_coverage(text: str) -> bool:
-        return any(token in text for token in ("istanbul", '"nyc"', '"c8"', "'nyc'", "'c8'"))
+        return any(
+            token in text
+            for token in ("istanbul", '"nyc"', '"c8"', "'nyc'", "'c8'", "vitest")
+        )
 
     # Nested Maven / Gradle modules (capped)
     for pattern in ("pom.xml", "build.gradle", "build.gradle.kts"):

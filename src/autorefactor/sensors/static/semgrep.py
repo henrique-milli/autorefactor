@@ -3,11 +3,18 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from autorefactor.analyzers.base import AnalyzerContext
+from autorefactor.domain import (
+    AnalysisGoal,
+    Finding,
+    Severity,
+    SuggestedAction,
+    content_hash,
+)
 from autorefactor.enrich.unit_match import units_covering_line
-from autorefactor.domain import AnalysisGoal, Finding, Severity, SuggestedAction, content_hash
 
 
 class SemgrepAnalyzer:
@@ -43,10 +50,10 @@ class SemgrepAnalyzer:
     def analyze(self, ctx: AnalyzerContext) -> list[Finding]:
         n_units = len(ctx.units)
         n_repos = len(ctx.repos)
-        # Large multi-repo trees: full rule packs × every repo can exceed hours and
-        # starve the job heartbeats (orphaned). Skip external semgrep; structural
-        # sensors already cover the cross-repo signal the user cares about.
-        large = n_units >= 4000 or n_repos >= 8
+        # Very large trees: full rule packs × every repo can exceed the job-stale
+        # window even in parallel. Skip external semgrep; structural sensors already
+        # cover the cross-repo signal the user cares about.
+        large = n_units >= 20_000 or n_repos >= 24
         if large:
             ctx.note(
                 self.name,
@@ -56,9 +63,10 @@ class SemgrepAnalyzer:
             )
             return []
         configs = self._configs_for(ctx)
-        per_repo_timeout = 300
+        per_repo_timeout = 240
         flags: list[Finding] = []
-        for repo in ctx.repos:
+
+        def _run_repo(repo: Path) -> list[Finding]:
             cmd = ["semgrep", "--json", "--quiet"]
             for cfg in configs:
                 cmd.extend(["--config", cfg])
@@ -73,14 +81,15 @@ class SemgrepAnalyzer:
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
                 ctx.note(self.name, "error", str(exc))
-                continue
+                return []
             if not proc.stdout.strip():
-                continue
+                return []
             try:
                 payload = json.loads(proc.stdout)
             except json.JSONDecodeError:
                 ctx.note(self.name, "error", "invalid JSON from semgrep")
-                continue
+                return []
+            repo_flags: list[Finding] = []
             for result in payload.get("results", []):
                 path = str(result.get("path") or "")
                 try:
@@ -105,7 +114,7 @@ class SemgrepAnalyzer:
                     "INFO": Severity.LOW,
                     "LOW": Severity.LOW,
                 }.get(severity_raw, Severity.MEDIUM)
-                flags.append(
+                repo_flags.append(
                     Finding(
                         id=content_hash(f"semgrep:{check_id}:{rel}:{start}:{message[:80]}"),
                         goal=AnalysisGoal.STATIC, sensor='static',
@@ -125,4 +134,11 @@ class SemgrepAnalyzer:
                         },
                     )
                 )
+            return repo_flags
+
+        # Parallel per-repo runs keep wall-clock bounded vs the job-stale window.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(_run_repo, repo): repo for repo in ctx.repos}
+            for future in as_completed(futures):
+                flags.extend(future.result() or [])
         return flags

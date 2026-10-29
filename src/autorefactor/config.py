@@ -34,7 +34,7 @@ DEFAULT_SIMILARITY_THRESHOLD = 0.78
 # Core sensors always available without host CLIs
 CORE_SENSORS = (
     "sim.method,sim.class,sim.fingerprint,slop,placement,structure,"
-    "complexity,coverage,test_quality,contract,cluster,wiring"
+    "complexity,coverage,test_quality,contract,cluster,wiring,supabase"
 )
 FULL_SENSORS = CORE_SENSORS + ",static.semgrep,static.ruff"
 STATIC_SENSOR_IDS = frozenset(

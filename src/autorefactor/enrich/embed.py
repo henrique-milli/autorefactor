@@ -21,6 +21,11 @@ EMBED_KINDS = {
     UnitKind.PROTO_MESSAGE,
     UnitKind.PROTO_RPC,
     UnitKind.PROTO_SERVICE,
+    UnitKind.SQL_TABLE,
+    UnitKind.SQL_POLICY,
+    UnitKind.SQL_FUNCTION,
+    UnitKind.SQL_TRIGGER,
+    UnitKind.SQL_INDEX,
     UnitKind.REPO,
 }
 

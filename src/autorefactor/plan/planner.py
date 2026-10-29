@@ -37,6 +37,9 @@ _KEEP_FALLBACK_KINDS = frozenset(
         "draft_in_memory_map",
         "orphan_kafka",
         "test_only_handler",
+        "missing_rls",
+        "permissive_rls_policy",
+        "service_role_in_client",
     }
 )
 _FALLBACK_KEEP_SCORE = 0.6

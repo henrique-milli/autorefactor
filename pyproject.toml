@@ -61,6 +61,7 @@ cluster = "autorefactor.sensors.builtins:cluster"
 "static.eslint" = "autorefactor.sensors.builtins:static_eslint"
 "static.java" = "autorefactor.sensors.builtins:static_java"
 wiring = "autorefactor.sensors.builtins:wiring"
+supabase = "autorefactor.sensors.builtins:supabase"
 
 [project.urls]
 Homepage = "https://autorefactor.ai"

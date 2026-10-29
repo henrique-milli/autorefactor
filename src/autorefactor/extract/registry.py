@@ -7,6 +7,7 @@ from autorefactor.extract.go import GoExtractor
 from autorefactor.extract.java import JavaExtractor
 from autorefactor.extract.proto import ProtoExtractor
 from autorefactor.extract.python_lang import PythonExtractor
+from autorefactor.extract.sql import SqlExtractor
 from autorefactor.extract.typescript import TypeScriptExtractor
 from autorefactor.models import CodeUnit
 
@@ -18,6 +19,7 @@ def default_extractors() -> list[LanguageExtractor]:
         PythonExtractor(),
         GoExtractor(),
         ProtoExtractor(),
+        SqlExtractor(),
     ]
 
 
