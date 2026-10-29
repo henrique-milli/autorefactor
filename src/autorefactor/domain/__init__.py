@@ -340,7 +340,6 @@ class RunManifest(BaseModel):
     out_dir: str = ""
     focus: str = "balanced"
     sensors_ran: list[str] = Field(default_factory=list)
-    hints_enabled: list[str] = Field(default_factory=list)
     chat_backend: str = "http"
     embed_backend: str = "http"
     describe_mode: str = "raw"

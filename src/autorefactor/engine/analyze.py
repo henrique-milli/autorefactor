@@ -386,7 +386,6 @@ def run_analyze(
         out_dir=str(layout.out_dir),
         focus=focus,
         sensors_ran=sensors_ran,
-        hints_enabled=[p.strip() for p in (config.hints or "").split(",") if p.strip()],
         chat_backend=chat_backend,
         embed_backend=embed_backend,
         describe_mode=mode,

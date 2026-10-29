@@ -44,22 +44,6 @@ def discover_sensors() -> dict[str, Sensor]:
     return found
 
 
-def discover_hint_packs() -> dict[str, object]:
-    found: dict[str, object] = {}
-    try:
-        eps = entry_points(group="autorefactor.hints")
-    except TypeError:  # pragma: no cover
-        eps = entry_points().select(group="autorefactor.hints")  # type: ignore[attr-defined]
-    for ep in eps:
-        try:
-            obj = ep.load()
-            pack = obj() if callable(obj) else obj
-            found[getattr(pack, "id", ep.name)] = pack
-        except Exception:  # noqa: BLE001
-            continue
-    return found
-
-
 def enabled_sensor_ids(config_sensors: str, registry: dict[str, Sensor]) -> list[str]:
     raw = (config_sensors or "auto").strip()
     if raw in {"", "auto", "*"}:
@@ -162,19 +146,5 @@ def run_sensors(
                 done += 1
                 if on_progress is not None:
                     on_progress(result.report.sensor, done, total)
-
-    # Hint packs
-    hint_ids = [
-        p.strip()
-        for p in getattr(ctx.config, "hints", "").split(",")
-        if p.strip()
-    ]
-    if hint_ids:
-        packs = discover_hint_packs()
-        for hid in hint_ids:
-            pack = packs.get(hid)
-            if pack is None:
-                continue
-            findings = pack.annotate(findings, ctx)  # type: ignore[attr-defined]
 
     return findings, reports

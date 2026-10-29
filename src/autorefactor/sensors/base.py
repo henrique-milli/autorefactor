@@ -37,13 +37,6 @@ class Sensor(Protocol):
         ...
 
 
-class HintPack(Protocol):
-    id: str
-
-    def annotate(self, findings: list[Finding], ctx: AnalysisContext) -> list[Finding]:
-        ...
-
-
 @dataclass
 class SensorRunResult:
     findings: list[Finding]

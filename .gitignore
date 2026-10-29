@@ -23,13 +23,3 @@ web/node_modules/
 web/.next/
 web/out/
 
-# Local agent-teams eval (private corpus / episode checkouts / secrets)
-eval/corpus.local.yaml
-eval/subjects/
-eval/artifacts/
-eval/secrets.local.env
-
-# Self-improve loop scratch at repo root (agents write these)
-/alpha_spec.json
-/alpha_result.json
-

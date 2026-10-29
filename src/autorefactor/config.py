@@ -182,8 +182,6 @@ class AutorefactorConfig(BaseSettings):
     sensors: str = "auto"
     # Optional: full | light (also via AUTOREFACTOR_PROFILE)
     profile: str | None = None
-    # Optional hint packs (e.g. jvm) — off by default
-    hints: str = ""
     semgrep_config: str | None = None
     coverage_threshold: float = 80.0
     # Cap ensure_tests findings per repo (ranked by uncovered LOC)

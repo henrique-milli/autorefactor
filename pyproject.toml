@@ -36,15 +36,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0.0", "ruff>=0.6.0", "pyyaml>=6.0"]
+dev = ["pytest>=8.0.0", "ruff>=0.6.0"]
 analyzers = ["ruff>=0.6.0"]
-eval = ["cursor-sdk>=0.1.0", "pyyaml>=6.0"]
 # System CLIs expected on PATH when enabled: semgrep, eslint, pmd/spotbugs, c8/coverage
 
 [project.scripts]
 autorefactor = "autorefactor.cli:app"
 autorefactor-mcp = "autorefactor.mcp.server:main"
-ar-eval = "ar_eval.waves:main"
 
 [project.entry-points."autorefactor.sensors"]
 "sim.method" = "autorefactor.sensors.builtins:sim_method"
@@ -64,17 +62,14 @@ cluster = "autorefactor.sensors.builtins:cluster"
 "static.java" = "autorefactor.sensors.builtins:static_java"
 wiring = "autorefactor.sensors.builtins:wiring"
 
-[project.entry-points."autorefactor.hints"]
-jvm = "autorefactor.hints.jvm:jvm"
-
 [project.urls]
 Homepage = "https://autorefactor.ai"
 Repository = "https://github.com/henrique-milli/autorefactor"
 
 [tool.setuptools.packages.find]
-where = ["src", "eval/src"]
-include = ["autorefactor*", "ar_eval*"]
+where = ["src"]
+include = ["autorefactor*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src", "eval/src"]
+pythonpath = ["src"]

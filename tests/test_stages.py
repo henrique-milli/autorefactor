@@ -5,7 +5,6 @@ from pathlib import Path
 from autorefactor.artifacts import layout_for, load_analyze_bundle, load_plan
 from autorefactor.config import AutorefactorConfig
 from autorefactor.document import find_document_gaps
-from autorefactor._legacy_plan import build_plan
 from autorefactor.stages.analyze import run_analyze
 from autorefactor.stages.index import run_index
 from autorefactor.testing.gaps import find_test_gaps
@@ -41,16 +40,6 @@ def test_analyze_skip_llm_has_no_plan(tmp_path: Path) -> None:
     units, flags, findings, manifest, notes = load_analyze_bundle(layout)
     assert units and findings is not None and manifest is not None
     assert any(getattr(n, "sensor", getattr(n, "name", "")) in {"structure", "builtin", "coverage"} for n in notes) or notes is not None
-
-
-def test_plan_has_no_s00_ensure_tests(tmp_path: Path) -> None:
-    out = tmp_path / "out"
-    config = AutorefactorConfig(workspace=FIXTURES, out_dir=out, skip_llm=True, sensors="auto")
-    artifacts = run_analyze(config)
-    plan = build_plan(artifacts.confirmed or [], artifacts.units, tests_required=True)
-    assert plan.steps
-    assert all(s.action.value != "ensure_tests" for s in plan.steps)
-    assert "autorefactor test" in plan.summary
 
 
 def test_gaps_dedupe_by_suggested_path() -> None:
