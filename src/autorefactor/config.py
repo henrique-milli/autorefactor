@@ -554,6 +554,11 @@ class AutorefactorConfig(BaseSettings):
             (root / marker).exists()
             for marker in ("pyproject.toml", "pom.xml", "go.mod", "package.json")
         ):
+            # JS workspace roots (pnpm/lerna) own their children as packages — never
+            # split them into per-child repos (children like apps/ carry no marker,
+            # so splitting would silently analyze a stray marker-bearing child only).
+            if any((root / ws).is_file() for ws in ("pnpm-workspace.yaml", "lerna.json")):
+                return [root] if keep(root) else []
             children = [
                 p
                 for p in sorted(root.iterdir())

@@ -526,6 +526,12 @@ def export_active_tar_gz(
 
     if paths:
         wanted = {p.replace("\\", "/").lstrip("./") for p in paths if p}
+        # Single-root workspaces are indexed under the workspace dir name (repo="active"),
+        # so touched paths arrive as "active/src/…" while files are root-relative "src/…".
+        prefix = f"{active.name}/"
+        wanted = wanted | {
+            p[len(prefix) :] for p in list(wanted) if p.startswith(prefix)
+        }
         files = sorted(f for f in list_workspace_files(active) if f in wanted)
         if not files:
             # Fall back to walking requested paths that exist on disk
