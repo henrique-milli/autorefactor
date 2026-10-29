@@ -362,12 +362,13 @@ def suggested_test_path(unit: CodeUnit) -> str:
             return f"{unit.repo}/{javaish.removesuffix('.java').rsplit('/', 1)[0]}/{stem}Test.java"
         stem = class_sym or name
         return f"{unit.repo}/src/test/java/{stem}Test.java"
-    if unit.language in {"typescript", "javascript"}:
+    if unit.language in {"typescript", "javascript", "tsx"}:
         parent = str(Path(path).parent).replace("\\", "/")
         if parent in {"", "."}:
             parent = "tests"
         stem = class_sym or name
-        return f"{unit.repo}/{parent}/{stem}.test.ts"
+        ext = ".test.tsx" if unit.role == "react_component" else ".test.ts"
+        return f"{unit.repo}/{parent}/{stem}{ext}"
     if unit.language == "go":
         stem = class_sym or name
         return f"{unit.repo}/{Path(path).with_name(stem + '_test.go')}"

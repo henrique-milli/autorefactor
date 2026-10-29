@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -54,6 +55,122 @@ _GRPC_TYPE = re.compile(
     re.IGNORECASE,
 )
 _BIT_PATH = re.compile(r"\bin\s+(\S+\.\w+)\b")
+
+_TS_ENTRY_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+_BUILD_SEGMENTS = frozenset({"dist", "build", "out", ".next", "node_modules", "coverage"})
+
+
+def _package_json_targets(repo: Path) -> list[tuple[str, str]]:
+    """(label, target) pairs in package.json that name a loadable file."""
+    path = repo / "package.json"
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(_read_text(path))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    out: list[tuple[str, str]] = []
+
+    def walk(node: object, label: str) -> None:
+        if isinstance(node, str):
+            out.append((label, node))
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                walk(value, f"{label}.{key}")
+        elif isinstance(node, list):
+            for idx, value in enumerate(node):
+                walk(value, f"{label}[{idx}]")
+
+    for key in ("main", "module", "bin"):
+        value = data.get(key)
+        if isinstance(value, (str, dict)):
+            walk(value, key)
+    if data.get("exports") is not None:
+        walk(data["exports"], "exports")
+    scripts = data.get("scripts")
+    if isinstance(scripts, dict):
+        for name, cmd in scripts.items():
+            if not isinstance(cmd, str):
+                continue
+            for token in cmd.split():
+                if token.startswith("-") or "=" in token or "$" in token or "*" in token:
+                    continue
+                if token.endswith(_TS_ENTRY_EXTS):
+                    out.append((f"scripts.{name}", token))
+    return out
+
+
+def _entry_target_resolvable(repo: Path, target: str) -> bool:
+    """True when the target exists, is build output, or resolves via a source sibling."""
+    t = (target or "").strip()
+    if not t or "*" in t or t.startswith(("#", "http:", "https:", "file:", "node:")):
+        return True
+    rel = t[2:] if t.startswith("./") else t.lstrip("/")
+    segments = set(rel.split("/")) & _BUILD_SEGMENTS
+    if segments:
+        return True  # build output — may not exist until the package builds
+    if (repo / rel).exists():
+        return True
+    stem = (repo / rel).with_suffix("")
+    return any(
+        Path(f"{stem}{ext}").exists()
+        for ext in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+    )
+
+
+def _package_entry_findings(
+    ctx: AnalysisContext,
+    repo: Path,
+) -> list[Finding]:
+    """Declared package entry/scripts targets that do not exist (wire or remove)."""
+    missing: list[str] = []
+    for label, target in _package_json_targets(repo):
+        if not _entry_target_resolvable(repo, target) and f"{label}={target}" not in missing:
+            missing.append(f"{label}={target}")
+    if not missing:
+        return []
+
+    repo_name = repo.name
+    anchor = production_type_for_repo(ctx, repo_name)
+    uid = anchor.id if anchor is not None else None
+    if uid is None:
+        uid = next(
+            (
+                u.id
+                for u in ctx.units
+                if u.repo == repo_name and u.kind == UnitKind.REPO
+            ),
+            None,
+        )
+    if uid is None:
+        return []
+    f = try_make_finding(
+        id=content_hash(f"wiring:package_entry:{repo_name}"),
+        goal=AnalysisGoal.STRUCTURE,
+        sensor="wiring",
+        severity=Severity.MEDIUM,
+        title=f"Dead package entry points in {repo_name}",
+        evidence=(
+            "package.json declares targets that do not exist: "
+            f"{'; '.join(missing)}. "
+            "Architectural decision: fix_entry_target (point at the real source) "
+            "or remove_dead_entry (drop the stale entry/script)."
+        ),
+        unit_ids=[uid],
+        action_hint=SuggestedAction.DOCUMENT,
+        score=0.75,
+        hints=["fix_entry_target", "remove_dead_entry"],
+        metadata={
+            "kind": "dead_package_entry",
+            "repo": repo_name,
+            "targets": missing[:8],
+        },
+        known_ids=ctx.known_ids(),
+    )
+    return [f] if f else []
 
 
 def _read_text(path: Path, limit: int = 500_000) -> str:
@@ -273,7 +390,12 @@ class WiringSensor:
     goal = AnalysisGoal.STRUCTURE
 
     def available(self, ctx: AnalysisContext) -> bool:
-        return any((repo / "pom.xml").exists() or (repo / "build.gradle").exists() for repo in ctx.repos)
+        return any(
+            (repo / "pom.xml").exists()
+            or (repo / "build.gradle").exists()
+            or (repo / "package.json").is_file()
+            for repo in ctx.repos
+        )
 
     def collect(self, ctx: AnalysisContext) -> list[Finding]:
         known = ctx.known_ids()
@@ -281,6 +403,7 @@ class WiringSensor:
 
         for repo_path in ctx.repos:
             repo_name = repo_path.name
+            findings.extend(_package_entry_findings(ctx, repo_path))
             has_dep, has_config, has_listener, bits = _scan_repo(repo_path)
             if has_dep or has_config:
                 if not has_listener:

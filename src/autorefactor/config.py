@@ -186,7 +186,7 @@ class AutorefactorConfig(BaseSettings):
     coverage_threshold: float = 80.0
     # Cap ensure_tests findings per repo (ranked by uncovered LOC)
     max_coverage_findings: int = 15
-    document_languages: str = "java,typescript,javascript,python"
+    document_languages: str = "java,typescript,tsx,javascript,python"
     max_test_iterations: int = 2
     config_file: Path | None = None
 

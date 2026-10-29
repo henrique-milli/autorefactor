@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import tree_sitter_typescript as tstypescript
@@ -10,6 +11,13 @@ from autorefactor.models import CodeUnit, UnitKind
 
 TS_LANGUAGE = Language(tstypescript.language_typescript())
 TSX_LANGUAGE = Language(tstypescript.language_tsx())
+
+TSX_SUFFIXES = frozenset({".tsx", ".jsx"})
+
+_HOOK_NAME = re.compile(r"^use[A-Z0-9]")
+_PASCAL_NAME = re.compile(r"^[A-Z][A-Za-z0-9]*$")
+# Cheap JSX markers: closing/self-closing tags or a returned/assigned JSX literal.
+_JSX_MARKER = re.compile(r"</[A-Za-z]|/>|=>\s*<|return\s*<")
 
 
 def _node_text(source: bytes, node: Node) -> str:
@@ -26,21 +34,37 @@ def _name_from_node(node: Node, source: bytes) -> str | None:
     return None
 
 
+def _react_role(name: str, snippet: str, *, is_tsx: bool) -> str:
+    """Tag React hooks and JSX-returning components (name/convention based)."""
+    if _HOOK_NAME.match(name):
+        return "react_hook"
+    if is_tsx and _PASCAL_NAME.match(name) and _JSX_MARKER.search(snippet):
+        return "react_component"
+    return ""
+
+
 class TypeScriptExtractor:
     language = "typescript"
     suffixes = (".ts", ".tsx", ".js", ".jsx")
 
+    @staticmethod
+    def _language_for(file_path: Path) -> str:
+        return "tsx" if file_path.suffix.lower() in TSX_SUFFIXES else "typescript"
+
     def extract(self, repo_name: str, repo_path: Path) -> list[CodeUnit]:
         units: list[CodeUnit] = []
         for file_path in iter_source_files(repo_path, self.suffixes):
-            lang = TSX_LANGUAGE if file_path.suffix.lower() in {".tsx", ".jsx"} else TS_LANGUAGE
-            parser = Parser(lang)
-            units.extend(self._extract_file(parser, repo_name, repo_path, file_path))
+            lang = self._language_for(file_path)
+            parser = Parser(TSX_LANGUAGE if lang == "tsx" else TS_LANGUAGE)
+            units.extend(
+                self._extract_file(parser, lang, repo_name, repo_path, file_path)
+            )
         return units
 
     def _extract_file(
         self,
         parser: Parser,
+        language: str,
         repo_name: str,
         repo_path: Path,
         file_path: Path,
@@ -57,7 +81,7 @@ class TypeScriptExtractor:
             path=rel,
             qualified_name=module_name,
             kind=UnitKind.MODULE,
-            language=self.language,
+            language=language,
             snippet=f"module {module_name}",
         )
         file_unit = make_unit(
@@ -65,14 +89,14 @@ class TypeScriptExtractor:
             path=rel,
             qualified_name=rel,
             kind=UnitKind.FILE,
-            language=self.language,
+            language=language,
             snippet=text,
             parent_id=module.id,
             end_line=text.count("\n") + 1,
         )
         units: list[CodeUnit] = [module, file_unit]
         tree = parser.parse(source)
-        self._walk(tree.root_node, source, repo_name, rel, file_unit.id, module_name, units)
+        self._walk(tree.root_node, source, repo_name, rel, file_unit.id, module_name, units, language)
         return units
 
     def _walk(
@@ -84,6 +108,7 @@ class TypeScriptExtractor:
         parent_id: str,
         prefix: str,
         units: list[CodeUnit],
+        language: str,
     ) -> None:
         interesting = {
             "class_declaration",
@@ -94,6 +119,7 @@ class TypeScriptExtractor:
             "method_definition",
             "generator_function_declaration",
         }
+        is_tsx = language == "tsx"
         for child in node.children:
             if child.type in interesting:
                 name = _name_from_node(child, source) or "anonymous"
@@ -104,22 +130,24 @@ class TypeScriptExtractor:
                     in {"function_declaration", "method_definition", "generator_function_declaration"}
                     else UnitKind.TYPE
                 )
+                snippet = _node_text(source, child)
                 unit = make_unit(
                     repo=repo,
                     path=rel,
                     qualified_name=qualified,
                     kind=kind,
-                    language=self.language,
-                    snippet=_node_text(source, child),
+                    language=language,
+                    snippet=snippet,
                     parent_id=parent_id,
                     start_line=child.start_point[0] + 1,
                     end_line=child.end_point[0] + 1,
                     start_byte=child.start_byte,
                     end_byte=child.end_byte,
+                    role=_react_role(name, snippet, is_tsx=is_tsx) if kind == UnitKind.FUNCTION else "",
                 )
                 units.append(unit)
                 if kind == UnitKind.TYPE:
-                    self._walk(child, source, repo, rel, unit.id, qualified, units)
+                    self._walk(child, source, repo, rel, unit.id, qualified, units, language)
             elif child.type == "lexical_declaration":
                 # const foo = () => {} / function expressions
                 for decl in child.children:
@@ -133,20 +161,22 @@ class TypeScriptExtractor:
                         "generator_function",
                     }:
                         continue
+                    snippet = _node_text(source, child)
                     units.append(
                         make_unit(
                             repo=repo,
                             path=rel,
                             qualified_name=f"{prefix}.{name}",
                             kind=UnitKind.FUNCTION,
-                            language=self.language,
-                            snippet=_node_text(source, child),
+                            language=language,
+                            snippet=snippet,
                             parent_id=parent_id,
                             start_line=child.start_point[0] + 1,
                             end_line=child.end_point[0] + 1,
                             start_byte=child.start_byte,
                             end_byte=child.end_byte,
+                            role=_react_role(name, snippet, is_tsx=is_tsx),
                         )
                     )
             else:
-                self._walk(child, source, repo, rel, parent_id, prefix, units)
+                self._walk(child, source, repo, rel, parent_id, prefix, units, language)

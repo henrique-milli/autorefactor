@@ -26,6 +26,7 @@ def make_unit(
     end_line: int = 0,
     start_byte: int = 0,
     end_byte: int = 0,
+    role: str = "",
 ) -> CodeUnit:
     snippet = truncate(snippet)
     return CodeUnit(
@@ -38,6 +39,7 @@ def make_unit(
         source_snippet=snippet,
         content_hash=content_hash(snippet),
         parent_id=parent_id,
+        role=role,
         span=CodeSpan(
             start_line=start_line,
             end_line=end_line,

@@ -14,6 +14,7 @@ from autorefactor.domain import (
     content_hash,
     try_make_finding,
 )
+from autorefactor.extract.base import iter_source_files
 from autorefactor.index.hierarchy import simple_name
 from autorefactor.sensors.anchors import production_type_for_repo, resolve_file_unit
 from autorefactor.sensors.base import AnalysisContext
@@ -255,7 +256,7 @@ _ORCHESTRATION_FILES = (
     "build.gradle",
 )
 _README_NAMES = ("README.md", "README", "readme.md")
-_POLYglot_LANGS = frozenset({"python", "go", "typescript", "javascript", "java"})
+_POLYglot_LANGS = frozenset({"python", "go", "typescript", "tsx", "javascript", "java"})
 
 
 def _repo_languages(units: list[CodeUnit], repo: str) -> set[str]:
@@ -573,6 +574,69 @@ def _dead_api_findings(
     return findings
 
 
+def _dead_api_findings_ts(
+    units: list[CodeUnit],
+    repo_path: Path,
+    repo_name: str,
+    known: set[str],
+) -> list[Finding]:
+    """TS/JS analog: symbol called from tests but absent from other production sources."""
+    main_sources: dict[str, str] = {}
+    test_sources: dict[str, str] = {}
+    for path in iter_source_files(repo_path, (".ts", ".tsx", ".js", ".jsx")):
+        rel = str(path.relative_to(repo_path)).replace("\\", "/")
+        text = _read_repo_text(path)
+        if is_test_path(rel):
+            test_sources[rel] = text
+        else:
+            main_sources[rel] = text
+    if not test_sources or not main_sources:
+        return []
+    test_blob = "\n".join(test_sources.values())
+
+    findings: list[Finding] = []
+    for unit in units:
+        if unit.repo != repo_name or unit.kind != UnitKind.FUNCTION:
+            continue
+        if is_test_path(unit.path):
+            continue
+        if unit.language not in {"typescript", "tsx", "javascript"}:
+            continue
+        sym = simple_name(unit.qualified_name)
+        if sym.lower() in _TRIVIAL_DUP_NAMES:
+            continue
+        # Test usage: a call site or JSX usage — never bare word collisions.
+        if not re.search(rf"\b{re.escape(sym)}\s*\(|<{re.escape(sym)}\b", test_blob):
+            continue
+        unit_rel = unit.path.replace("\\", "/")
+        # Production usage is lenient (word boundary) so value references count too.
+        in_main_elsewhere = any(
+            rel != unit_rel and re.search(rf"\b{re.escape(sym)}\b", text)
+            for rel, text in main_sources.items()
+        )
+        if in_main_elsewhere:
+            continue
+        f = try_make_finding(
+            id=content_hash(f"structure:dead_api_ts:{unit.id}"),
+            goal=AnalysisGoal.STRUCTURE,
+            sensor="structure",
+            severity=Severity.MEDIUM,
+            title=f"Test-only API `{unit.qualified_name}` in {repo_name}",
+            evidence=(
+                f"`{sym}` is called from tests but never from other production sources — "
+                "dead or test-only surface; wire it into the production path or remove it."
+            ),
+            unit_ids=[unit.id],
+            action_hint=SuggestedAction.DELETE_DUPLICATE,
+            score=0.78,
+            metadata={"kind": "test_only_api", "repo": repo_name, "symbol": sym},
+            known_ids=known,
+        )
+        if f:
+            findings.append(f)
+    return findings
+
+
 def _misleading_catch_findings(
     units: list[CodeUnit],
     repo_name: str,
@@ -638,5 +702,6 @@ def _repo_hygiene_findings(
         if readme_uid:
             findings.extend(_readme_consistency_findings(repo_path, repo_name, readme_uid, known))
         findings.extend(_dead_api_findings(units, repo_path, repo_name, known))
+        findings.extend(_dead_api_findings_ts(units, repo_path, repo_name, known))
         findings.extend(_misleading_catch_findings(units, repo_name, known))
     return findings

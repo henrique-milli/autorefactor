@@ -69,6 +69,21 @@ _PY_IDENTITY_SHORT = re.compile(
 _GO_IDENTITY = re.compile(
     r"func\s+(\w+)\((\w+)\s+\w+\)\s+\w+\s*\{\s*return\s+\2\s*\}",
 )
+# TS/JS identity helpers: (x) => x / function f(x) { return x; } — the returned
+# expression must be exactly the parameter (no `x + 1` false positives).
+_TS_IDENTITY_ARROW_PAREN = re.compile(
+    r"(?:export\s+)?(?:const|let)\s+(\w+)\s*=\s*\(\s*(\w+)\s*[^)]*\)\s*(?::[^=\n]+)?"
+    r"=>\s*(?:\{\s*return\s+\2\s*;?\s*\}|\2\s*[;,]?\s*$)",
+    re.MULTILINE,
+)
+_TS_IDENTITY_ARROW_BARE = re.compile(
+    r"(?:export\s+)?(?:const|let)\s+(\w+)\s*=\s*(\w+)\s*"
+    r"=>\s*(?:\{\s*return\s+\2\s*;?\s*\}|\2\s*[;,]?\s*$)",
+    re.MULTILINE,
+)
+_TS_IDENTITY_FUNC = re.compile(
+    r"(?:export\s+)?function\s+(\w+)\s*\(\s*(\w+)\s*[^)]*\)\s*\{\s*return\s+\2\s*;?\s*\}"
+)
 
 
 def _identity_helpers_in_source(snippet: str, language: str) -> list[tuple[str, str]]:
@@ -77,6 +92,15 @@ def _identity_helpers_in_source(snippet: str, language: str) -> list[tuple[str, 
     if language == "go":
         for m in _GO_IDENTITY.finditer(snippet):
             out.append((m.group(1), m.group(2)))
+    elif language in {"typescript", "tsx", "javascript"}:
+        seen: set[str] = set()
+        for pat in (_TS_IDENTITY_ARROW_PAREN, _TS_IDENTITY_ARROW_BARE, _TS_IDENTITY_FUNC):
+            for m in pat.finditer(snippet):
+                key = m.group(1)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append((m.group(1), m.group(2)))
     elif language == "python":
         seen: set[str] = set()
         for pat in (_PY_IDENTITY_ONELINE, _PY_IDENTITY_SHORT):

@@ -46,7 +46,7 @@ def _impl_units(units: list[CodeUnit]) -> list[CodeUnit]:
         for u in units
         if u.kind in {UnitKind.FUNCTION, UnitKind.TYPE}
         and not is_test_path(u.path)
-        and u.language in {"python", "go", "typescript", "javascript", "java"}
+        and u.language in {"python", "go", "typescript", "tsx", "javascript", "java"}
     ]
 
 
@@ -194,7 +194,7 @@ class ContractSensor:
             if special == "normalize_user_id":
                 proto_unit = rpcs.get("normalize_user") or proto_unit
             if special == "merge_scores":
-                ts_has = any(u.language in {"typescript", "javascript"} for u in group)
+                ts_has = any(u.language in {"typescript", "tsx", "javascript"} for u in group)
                 py_has = any(u.language == "python" for u in group)
                 proto_has = "merge_scores" in rpcs
                 if py_has and proto_has and not ts_has:

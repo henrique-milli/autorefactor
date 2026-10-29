@@ -116,6 +116,8 @@ class CodeUnit(BaseModel):
     span: CodeSpan = Field(default_factory=CodeSpan)
     description: str | None = None
     tags: list[str] = Field(default_factory=list)
+    # Structural role inside its language ecosystem (e.g. react_component / react_hook)
+    role: str = ""
     # Language-neutral text facets (filled by enrich/facets via DocPack)
     documentation: str | None = None
     signature: str | None = None

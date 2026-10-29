@@ -15,15 +15,19 @@ from autorefactor.domain import (
     content_hash,
     try_make_finding,
 )
+from autorefactor.extract.base import iter_source_files
 from autorefactor.sensors.base import AnalysisContext
+from autorefactor.sensors.similarity import is_test_path
 
 _MARKER = "(autorefactor ensure-tests)"
 _SYMBOL_ONLY = re.compile(
-    r"def\s+test_\w+_(symbol_exists|is_importable)\s*\(",
+    r"def\s+test_\w+_(symbol_exists|is_importable)\s*\("
+    r"|(?:test|it)\(\s*[\"'][^\"']*symbol_exists",
     re.MULTILINE,
 )
 _BEHAVIOR_ASSERT = re.compile(
-    r"assert\s+\w+\([^)]*\)\s*==|pytest\.mark\.parametrize|assert\s+\w+\.snapshot\(\)",
+    r"assert\s+\w+\([^)]*\)\s*==|pytest\.mark\.parametrize|assert\s+\w+\.snapshot\(\)"
+    r"|\.to(?:Equal|StrictEqual|Contain|MatchSnapshot)\(|assert\.(?:deepEqual|strictEqual)\(",
     re.MULTILINE,
 )
 _IMPORT_MOD = re.compile(
@@ -95,6 +99,19 @@ def _scan_repo_tests(repo: Path) -> list[tuple[str, str]]:
         if not path.is_file():
             continue
         rel = f"{repo.name}/{path.relative_to(repo).as_posix()}"
+        try:
+            out.append((rel, path.read_text(encoding="utf-8", errors="replace")))
+        except OSError:
+            continue
+    # TS/JS unit tests (vitest / node:test / jest colocated or under __tests__)
+    for path in iter_source_files(repo, (".ts", ".tsx", ".js", ".jsx")):
+        name = path.name
+        if ".test." not in name and ".spec." not in name:
+            continue
+        rel_path = path.relative_to(repo).as_posix()
+        if not is_test_path(rel_path):
+            continue
+        rel = f"{repo.name}/{rel_path}"
         try:
             out.append((rel, path.read_text(encoding="utf-8", errors="replace")))
         except OSError:

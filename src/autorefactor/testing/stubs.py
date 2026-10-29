@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import textwrap
 from collections import defaultdict
@@ -195,6 +196,91 @@ def write_python_characterization_stub(
     return _write_stub_file(workspace, gap.repo, rel_in_repo, body)
 
 
+_TS_SOURCE_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+
+
+def _ts_import_spec(unit: CodeUnit, test_rel_in_repo: str) -> str:
+    """Extensionless relative import from the test file to the unit source."""
+    test_dir = Path(test_rel_in_repo).parent.as_posix()
+    unit_path = unit.path.replace("\\", "/")
+    rel = os.path.relpath(unit_path, start=test_dir or ".").replace("\\", "/")
+    for ext in _TS_SOURCE_EXTS:
+        if rel.endswith(ext):
+            rel = rel[: -len(ext)]
+            break
+    if not rel.startswith("."):
+        rel = f"./{rel}"
+    return rel
+
+
+def _ts_runner(workspace: Path, gap: TestGap, test_rel_in_repo: str) -> str:
+    """Pick the repo's unit-test runner: 'vitest' when configured, else node:test."""
+    test_file = resolve_repo_file(workspace, gap.repo, test_rel_in_repo)
+    root = test_file.parent
+    for _ in range(8):
+        pkg = root / "package.json"
+        if pkg.is_file():
+            text = pkg.read_text(encoding="utf-8", errors="replace")
+            if "vitest" in text or any(root.glob("vitest.config.*")):
+                return "vitest"
+            return "node"
+        if root.parent == root:
+            break
+        root = root.parent
+    return "node"
+
+
+def write_ts_characterization_stub(
+    workspace: Path,
+    gap: TestGap,
+    unit: CodeUnit,
+) -> str | None:
+    """Write a TS/JS characterization stub (skip_llm path) for vitest or node:test."""
+    if gap.language not in {"typescript", "tsx", "javascript"}:
+        return None
+    if not unit.path.replace("\\", "/").endswith(_TS_SOURCE_EXTS):
+        return None
+
+    rel = gap.suggested_test_path
+    rel_in_repo = rel[len(gap.repo) + 1 :] if rel.startswith(f"{gap.repo}/") else rel
+
+    spec = _ts_import_spec(unit, rel_in_repo)
+    simple = unit.qualified_name.rsplit(".", 1)[-1]
+    ident = _safe_ident(simple)
+    runner = _ts_runner(workspace, gap, rel_in_repo)
+
+    if runner == "vitest":
+        body = textwrap.dedent(
+            f'''\
+            // Characterization tests for `{unit.qualified_name}` (autorefactor ensure-tests).
+            // Replace the module-load smoke with real behavior assertions.
+            import {{ expect, test }} from "vitest";
+
+            test("symbol_exists {ident}", async () => {{
+              const spec = "{spec}";
+              const mod = (await import(/* @vite-ignore */ spec)) as Record<string, unknown>;
+              expect(mod).toBeTruthy();
+            }});
+            '''
+        )
+    else:
+        body = textwrap.dedent(
+            f'''\
+            // Characterization tests for `{unit.qualified_name}` (autorefactor ensure-tests).
+            // Replace the module-load smoke with real behavior assertions.
+            import assert from "node:assert";
+            import {{ test }} from "node:test";
+
+            test("symbol_exists {ident}", async () => {{
+              const spec = "{spec}";
+              const mod = (await import(spec).catch(() => null)) as Record<string, unknown> | null;
+              assert.ok(mod, `module ${{spec}} should import — wire the real path for your runner`);
+            }});
+            '''
+        )
+    return _write_stub_file(workspace, gap.repo, rel_in_repo, body)
+
+
 def write_skip_llm_test_stubs(
     workspace: Path,
     test_plan: TestPlan,
@@ -216,7 +302,7 @@ def write_skip_llm_test_stubs(
             gap,
             unit,
             sibling_units=units,
-        )
+        ) or write_ts_characterization_stub(workspace, gap, unit)
         if path and path not in created:
             created.append(path)
     return created
