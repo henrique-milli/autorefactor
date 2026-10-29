@@ -301,7 +301,7 @@ export async function fetchHealth() {
     backends?: { chat?: string; embed?: string };
     ollama_ok?: boolean | null;
     ollama_required?: boolean;
-    compose_hint?: string | null;
+    hint?: string | null;
     llm_model?: string;
     embed_model?: string;
   }>("/health");
@@ -315,7 +315,7 @@ export async function fetchRuntimeDetect() {
     ollama_url?: string | null;
     cuda_hint?: string | null;
     recommendation?: RuntimeTemplate & { template_id?: string; rationale?: string };
-    compose_hint?: string | null;
+    hint?: string | null;
   }>("/v1/runtime/detect");
 }
 

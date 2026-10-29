@@ -53,8 +53,8 @@ def build_agent_guidance(config: AutorefactorConfig) -> dict[str, Any]:
         )
     if runtime.get("ollama_required"):
         workflow.append(
-            "If Ollama is required but down: tell the user to run "
-            "`docker compose --profile ollama up -d` (Settings cannot start containers)."
+            "If Ollama is required but down: tell the user to start it with "
+            "`ollama serve` (Settings cannot start it for you)."
         )
     describe = runtime.get("describe_mode") or "raw"
     if describe == "describe":
@@ -99,7 +99,7 @@ def build_agent_guidance(config: AutorefactorConfig) -> dict[str, Any]:
     forbidden = [
         "Do not call prepare_workspace for a locally open project.",
         "Never put tokens or passwords in git_url — use AUTOREFACTOR_GIT_TOKEN on the server.",
-        "Do not point Cursor at Docker /mcp directly if you need cwd sync — use stdio autorefactor-mcp.",
+        "Do not point Cursor at an http://…/mcp endpoint if you need cwd sync — use stdio autorefactor-mcp (HTTP /mcp only sees synced workspaces).",
         "Do not skip phase CTAs (after analyze, before enrich, before prep, before queue) unless "
         "the user already ordered that phase in the same turn.",
         "Do not ask the user to confirm high-confidence (auto_proceed) changesets.",

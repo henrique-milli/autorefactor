@@ -9,24 +9,28 @@ Site: [autorefactor.ai](https://autorefactor.ai) · License: MIT
 ## Who this is for
 
 - You use Cursor (or similar) with MCP and want the agent to work a backlog, not invent one from vibes.
-- You have multi-repo or polyglot trees (Java, TypeScript/TSX, Python, Go, Protobuf today).
-- You’re fine running Docker locally (or Podman / Rancher Desktop with the same Compose files).
+- You have multi-repo or polyglot trees (Java, TypeScript/TSX, Python, Go, Protobuf, SQL today).
 
 If you need a push-button “refactor my monorepo with zero review,” this isn’t that. High-confidence items can auto-proceed; low-confidence ones stop for HITL.
 
 ## Quickstart
 
-**Needs:** Docker Compose, Python ≥ 3.11 on the host (for the MCP stdio proxy). Prefer `uv`.
+**Needs:** Python ≥ 3.11 (prefer [`uv`](https://docs.astral.sh/uv/)) and Node ≥ 18 for the report UI.
 
 ```bash
 uv sync --extra dev
-docker compose up -d --build
+
+# terminal 1 — engine + HTTP API (:8765)
+AUTOREFACTOR_MCP_TRANSPORT=streamable-http uv run autorefactor-mcp
+
+# terminal 2 — report UI (:3000)
+cd web && npm install && AUTOREFACTOR_API_URL=http://127.0.0.1:8765 npm run dev
 ```
 
 Health: [http://localhost:3000](http://localhost:3000) (UI) and [http://localhost:8765](http://localhost:8765) (engine).
 
 1. Open [http://localhost:3000/settings](http://localhost:3000/settings) and paste an OpenAI-compatible API key (template: **Fast cloud**).
-2. Add the stdio proxy to your editor so the **project you have open** syncs to the engine (Cursor example).
+2. Add the stdio MCP to your editor so the **project you have open** syncs to the engine (Cursor example).
 
 Use an **absolute path** to the venv you created with `uv sync` in this repo. Cursor starts MCP without that repo as cwd, so bare `uv run autorefactor-mcp` often fails when your editor workspace is a different project.
 
@@ -38,15 +42,14 @@ Use an **absolute path** to the venv you created with `uv sync` in this repo. Cu
       "args": ["-m", "autorefactor.mcp.server"],
       "env": {
         "AUTOREFACTOR_REMOTE_URL": "http://127.0.0.1:8765",
-        "AUTOREFACTOR_MCP_TRANSPORT": "stdio",
-        "AUTOREFACTOR_DOCKER_CONTAINER": "autorefactor"
+        "AUTOREFACTOR_MCP_TRANSPORT": "stdio"
       }
     }
   }
 }
 ```
 
-Replace `/path/to/autorefactor` with your clone (e.g. `/home/you/Git/hmd/autorefactor`). `AUTOREFACTOR_DOCKER_CONTAINER` matches the Compose service name; omit it if you use the default `autorefactor`.
+Replace `/path/to/autorefactor` with your clone (e.g. `/home/you/Git/henrique/autorefactor`).
 
 **Alternative** (only when this repo is on PATH after `uv sync`, or your MCP `cwd` is the autorefactor clone):
 
@@ -65,7 +68,7 @@ Replace `/path/to/autorefactor` with your clone (e.g. `/home/you/Git/hmd/autoref
 }
 ```
 
-Why stdio instead of hitting `/mcp` in the browser? The local process can see your cwd and upload uncommitted work; a bare HTTP MCP only sees the container workspace.
+Why stdio instead of hitting `/mcp` over HTTP? The local process can see your cwd and upload uncommitted work; a bare HTTP MCP only sees the last synced workspace. Omit `AUTOREFACTOR_REMOTE_URL` entirely to run the whole pipeline in-process (no engine process needed).
 
 3. Open **your** messy project in the editor (not this product repo unless that is what you want analyzed). [http://localhost:3000/runs](http://localhost:3000/runs) stays empty until an agent runs `analyze`.
 
@@ -87,16 +90,10 @@ No API key → analyze fails with a setup hint. Add a key in Settings, or use lo
 Host IDE does chat; Ollama does embeddings:
 
 ```bash
-docker compose --profile ollama up -d --build
+ollama serve
 ```
 
-Settings → **Local agent** (or **Detect best setup**) → Save.
-
-NVIDIA GPU for Ollama:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile ollama up -d --build
-```
+Settings → **Local agent** (or **Detect best setup**) → Save. For GPU embeddings the Ollama server must be able to see the GPU (`nvidia-smi` works in its environment).
 
 ## Enterprise
 
@@ -104,16 +101,15 @@ Default **Fast cloud** is fine for many teams: embeddings (and HTTP chat) go to 
 
 If code or prompts must stay on-prem:
 
-1. Start Compose with `--profile ollama` (GPU overlay if you have NVIDIA—see above).
+1. Run a local Ollama server (`ollama serve`) instead of configuring a cloud key.
 2. Settings: **Local agent** (`chat_backend=agent`, `embed_backend=local`) so chat stays in the IDE; or **Fully local chat** (`chat_backend=http` + `local_chat`, `embed_backend=local`) if you have an NVIDIA GPU with at least ~4GB VRAM.
 3. Do **not** set a cloud API key (or clear it). Embeddings stay on Ollama; chat is either the IDE or a local Ollama model.
 
 Operational constraints (same whether cloud or local):
 
 - Ports `8765`, `3000`, and `11434` have **no auth**. Keep them on localhost / a trusted network—do not publish them.
-- Keys and config live under `./.autorefactor-data` (container `~/.autorefactor`). Don’t commit that directory.
-- The UI does not control Docker (no socket mount, no DinD).
-- Podman / Rancher Desktop: same Compose files; use your compose CLI if you don’t use Docker Engine.
+- Keys and config live under `~/.autorefactor/config.toml`. Don’t print or commit it.
+- The UI only writes Settings; it does not start the engine or Ollama.
 
 MIT, no warranty—see [LICENSE](LICENSE).
 
@@ -121,24 +117,20 @@ MIT, no warranty—see [LICENSE](LICENSE).
 
 | Piece | Role |
 |-------|------|
-| Engine (Compose) | Extract → embed → sensors → changeset + enrich queues |
+| Engine | Extract → embed → sensors → changeset + enrich queues |
 | Host agent (MCP) | Runs analyze, optional enrich, applies edits from the queue |
 | Report UI | Viewer: runs, ROI, map, queue, jobs, Settings. Does **not** start analyze |
 
-Artifacts default to `./.autorefactor-data`. Workspace defaults to the Compose mount (`.` → `/workspace`).
+Artifacts default to `~/.autorefactor`. Local projects are synced there (`~/.autorefactor/workspaces/active`, tar.gz over HTTP) before analysis.
 
-More on axes and compose profiles: [docs/runtime-backends.md](docs/runtime-backends.md).
-
-## Self-improve loop
-
-Developers of this product can run simulated users against stimulus repos, patch allowlisted product code, and retest. **Green retest means spec probes on every episode**, not a dashboard `1.00` from the first repo. Details and flags (`--alpha-timeout`, `--retest-agent`, `--skip-retest`): [docs/self-improve.md](docs/self-improve.md). `uv sync --extra eval && uv run ar-eval loop --iterations 3 --example-only`.
+More on axes and backends: [docs/runtime-backends.md](docs/runtime-backends.md).
 
 ## Configuration
 
 Axes (Settings or `AUTOREFACTOR_*` env):
 
 | Axis | Values | Notes |
-|------|--------|--------|
+|------|--------|-------|
 | `chat_backend` | `agent` \| `http` \| `none` | IDE vs OpenAI-compatible HTTP |
 | `embed_backend` | `local` \| `http` \| `none` | Ollama vs cloud |
 | `embed_device` | `cpu` \| `gpu` | Local embed model pick |
@@ -156,12 +148,12 @@ uv sync --extra dev
 uv run pytest
 ```
 
-Engine without the web image: `AUTOREFACTOR_MCP_TRANSPORT=streamable-http uv run autorefactor-mcp`, and `cd web && npm run dev` with `AUTOREFACTOR_API_URL=http://127.0.0.1:8765`.
+Run engine + UI as in the Quickstart.
 
 ## Status / limits
 
 - Beta: APIs and queue scoring will move.
-- Semgrep / ESLint / Java static sensors need those CLIs on the engine image or host when you enable the full profile.
+- Semgrep / ESLint / Java static sensors need those CLIs on the host when you enable the full profile.
 - Issues and PRs welcome once the repo is public; no CONTRIBUTING guide yet—keep changes small and include tests.
 
 ## License

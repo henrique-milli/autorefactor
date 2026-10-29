@@ -104,7 +104,7 @@ def run_sensors(
                     SensorReport(
                         sensor=name,
                         status="error",
-                        detail="required tool not available on PATH (pip/brew install CLI, or use Docker image)",
+                        detail="required tool not available on PATH (install the CLI, e.g. pip or brew)",
                     ),
                 )
             return SensorRunResult(

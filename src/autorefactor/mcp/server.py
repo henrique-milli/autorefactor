@@ -19,7 +19,7 @@ def _tool_list() -> list[dict[str, Any]]:
             "name": "workspace_status",
             "description": (
                 "Whether the active workspace is synced (file_count, source, root). "
-                "With local stdio MCP + Docker, the open project is uploaded automatically."
+                "With local stdio MCP, the open project is uploaded automatically."
             ),
             "inputSchema": {"type": "object", "properties": {}},
         },

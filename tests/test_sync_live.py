@@ -1,4 +1,4 @@
-"""Live sync proof against a running autorefactor Docker engine (optional)."""
+"""Live sync proof against a running autorefactor engine (optional)."""
 
 from __future__ import annotations
 

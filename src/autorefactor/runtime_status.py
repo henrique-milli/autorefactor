@@ -32,8 +32,6 @@ def _ollama_roots(cfg: AutorefactorConfig) -> list[str]:
     roots: list[str] = []
     for candidate in (
         cfg.ollama_base_url,
-        "http://ollama:11434/v1",
-        "http://host.docker.internal:11434/v1",
         "http://127.0.0.1:11434/v1",
     ):
         root = (candidate or "").rstrip("/")
@@ -50,7 +48,7 @@ def probe_ollama_any(cfg: AutorefactorConfig) -> tuple[bool, str | None]:
 
 
 def detect_nvidia() -> dict[str, Any]:
-    """Best-effort nvidia-smi probe (often unavailable inside the engine container)."""
+    """Best-effort nvidia-smi probe on the engine host."""
     if not shutil.which("nvidia-smi"):
         return {
             "available": False,
@@ -87,10 +85,10 @@ def ollama_cuda_hint(cfg: AutorefactorConfig, nvidia: dict[str, Any], ollama_ok:
         return None
     if not nvidia.get("available"):
         return None
-    # Engine cannot see Ollama's GPU binding reliably; advise GPU overlay when NVIDIA is present.
+    # Advise GPU use only when Ollama + NVIDIA are both present.
     return (
-        "NVIDIA GPU detected. If Ollama embeddings are slow, restart with: "
-        "docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile ollama up -d --build"
+        "NVIDIA GPU detected. For fast local embeddings, run Ollama where it can see the GPU "
+        "(nvidia-smi must work in its environment)."
     )
 
 
@@ -136,14 +134,11 @@ def runtime_detect_payload(config: AutorefactorConfig | None = None) -> dict[str
     nvidia = detect_nvidia()
     ollama_ok, ollama_url = probe_ollama_any(cfg)
     recommendation = recommend_axes(ollama_ok=ollama_ok, nvidia=nvidia)
-    compose_hint = None
+    hint = None
     if recommendation.get("embed_backend") == "local" and not ollama_ok:
-        compose_hint = "docker compose --profile ollama up -d --build"
+        hint = "Start a local Ollama server (`ollama serve`) — Settings cannot start it for you."
     elif recommendation.get("embed_device") == "gpu":
-        compose_hint = (
-            "docker compose -f docker-compose.yml -f docker-compose.gpu.yml "
-            "--profile ollama up -d --build"
-        )
+        hint = "Ollama reachable — confirm it sees the GPU (nvidia-smi) for fast local embeddings."
     return {
         "ok": True,
         "nvidia": nvidia,
@@ -151,7 +146,7 @@ def runtime_detect_payload(config: AutorefactorConfig | None = None) -> dict[str
         "ollama_url": ollama_url,
         "cuda_hint": ollama_cuda_hint(cfg, nvidia, ollama_ok),
         "recommendation": recommendation,
-        "compose_hint": compose_hint,
+        "hint": hint,
     }
 
 
@@ -182,8 +177,8 @@ def runtime_health_payload(config: AutorefactorConfig | None = None) -> dict[str
         "ollama_required": ollama_required,
         "ollama_ok": ollama_ok,
         "profile": summary["profile"],
-        "compose_hint": (
-            "docker compose --profile ollama up -d --build"
+        "hint": (
+            "Ollama is required but unreachable — start it with `ollama serve`."
             if ollama_required and ollama_ok is False
             else None
         ),
@@ -204,18 +199,17 @@ def status_html(payload: dict[str, Any] | None = None) -> str:
                     "env": {
                         "AUTOREFACTOR_REMOTE_URL": "http://127.0.0.1:8765",
                         "AUTOREFACTOR_MCP_TRANSPORT": "stdio",
-                        "AUTOREFACTOR_DOCKER_CONTAINER": "autorefactor",
                     },
                 }
             }
         },
         indent=2,
     )
-    hint = data.get("compose_hint") or ""
+    hint = data.get("hint") or ""
     hint_html = (
         f"<p><code>{hint}</code></p>"
         if hint
-        else "<p>Paste an API key in Settings, or enable local Ollama with <code>--profile ollama</code>.</p>"
+        else "<p>Paste an API key in Settings, or run a local <code>ollama serve</code> for private embeddings.</p>"
     )
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -273,8 +267,8 @@ def status_html(payload: dict[str, Any] | None = None) -> str:
   </div>
   <h2>Quick start</h2>
   <ol>
-    <li><strong>Cloud</strong> — <code>docker compose up -d --build</code>, paste OpenAI key in Settings.</li>
-    <li><strong>Local agent</strong> — <code>docker compose --profile ollama up -d --build</code>, set chat=agent embed=local.</li>
+    <li><strong>Cloud</strong> — paste an OpenAI-compatible API key in <a href="http://localhost:3000/settings">Settings</a>.</li>
+    <li><strong>Local agent</strong> — run <code>ollama serve</code>, then set chat=agent embed=local in Settings.</li>
   </ol>
   {hint_html}
   <h2>Cursor MCP (stdio proxy)</h2>

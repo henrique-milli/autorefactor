@@ -12,9 +12,9 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardDesc, CardTitle } from "@/components/ui/card";
 
-const COMPOSE_OLLAMA = "docker compose --profile ollama up -d --build";
-const COMPOSE_OLLAMA_GPU =
-  "docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile ollama up -d --build";
+const OLLAMA_START = "ollama serve";
+const OLLAMA_GPU_TIP =
+  "Ollama uses the GPU automatically when its server can see it (nvidia-smi works).";
 
 function Tip({ text }: { text: string }) {
   return (
@@ -39,7 +39,7 @@ export default function SettingsPage() {
   const [health, setHealth] = useState<{
     ollama_ok?: boolean | null;
     ollama_required?: boolean;
-    compose_hint?: string | null;
+    hint?: string | null;
   } | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -90,7 +90,7 @@ export default function SettingsPage() {
       if (r) {
         applyTemplate(r);
         setDetectNote(
-          [r.rationale, d.cuda_hint, d.compose_hint].filter(Boolean).join(" "),
+          [r.rationale, d.cuda_hint, d.hint].filter(Boolean).join(" "),
         );
       }
       const h = await fetchHealth().catch(() => null);
@@ -141,8 +141,8 @@ export default function SettingsPage() {
       <div>
         <h1 className="text-4xl">Settings</h1>
         <p className="mt-2 max-w-2xl text-muted">
-          Compose chat/embed backends and keys. This UI does not start or stop
-          containers — use compose <code className="text-ink">--profile ollama</code>{" "}
+          Compose chat/embed backends and keys. This UI does not start
+          processes — run <code className="text-ink">ollama serve</code> yourself
           for local embeddings.
         </p>
       </div>
@@ -291,12 +291,12 @@ export default function SettingsPage() {
         <Card>
           <CardTitle>Ollama not reachable</CardTitle>
           <CardDesc>
-            Local embeddings need the Ollama compose profile. Run from the repo root:
+            Local embeddings need a running Ollama server:
           </CardDesc>
           <pre className="mt-3 overflow-auto rounded-lg bg-paper p-3 text-xs text-muted">
-            {COMPOSE_OLLAMA}
+            {OLLAMA_START}
             {"\n"}
-            {COMPOSE_OLLAMA_GPU}
+            {OLLAMA_GPU_TIP}
           </pre>
         </Card>
       ) : null}

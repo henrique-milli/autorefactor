@@ -22,13 +22,13 @@ Axes (Settings or `AUTOREFACTOR_*` env):
 | Cloud chat | `gpt-5.6-luna` |
 | Cloud embed | `text-embedding-3-small` |
 
-## Compose
+## Running
 
 | Path | Command |
 |------|---------|
-| Cloud (engine + web) | `docker compose up -d --build` |
-| Local embed CPU | `docker compose --profile ollama up -d --build` |
-| Local embed GPU | `docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile ollama up -d --build` |
+| Engine + API + MCP | `AUTOREFACTOR_MCP_TRANSPORT=streamable-http uv run autorefactor-mcp` |
+| Report UI | `cd web && AUTOREFACTOR_API_URL=http://127.0.0.1:8765 npm run dev` |
+| Local embeddings | `ollama serve` (CPU or GPU, if the server can see it) |
 
 Settings edits axes only. `GET /v1/runtime/detect` recommends axes (GPU/Ollama best-effort).
 
@@ -57,9 +57,8 @@ Spring/Kafka microservices benefit from reading **`wiring`**, **`test_quality`**
 | Divergent merge paths (`mapTo*Response` / `merge*`) | `sim.method` | Unify append-vs-sum merge APIs **after** consumer wiring; see `structure` for dead test-only APIs. |
 | Committed secrets / README build drift | `structure` | Rotate credentials and fix docs before agents follow stale `mvn` vs `gradle` instructions. |
 | Draft in-memory maps / disabled startup validation | `slop` | Resolve config validation and mapping sources before feature work. |
-| Domain DTO leaks / mapper↔mapping package split | `jvm` hints (`hints=jvm`) | Enable hint pack for layer-boundary rename suggestions on clients and mapping services. |
 
-Recommended analyze prep: `autorefactor analyze` with core sensors + `hints=jvm`. Prioritize: **wire consumer → integration tests → unify merge API → layer cleanup**.
+Recommended analyze prep: `autorefactor analyze` with core sensors. Prioritize: **wire consumer → integration tests → unify merge API → layer cleanup**.
 
 ## Status
 

@@ -35,7 +35,7 @@ RUNTIME_TEMPLATES = [
     {
         "id": "local_agent",
         "label": "Local agent",
-        "description": "Host IDE chat; local Ollama embeddings (run compose --profile ollama)",
+        "description": "Host IDE chat; local Ollama embeddings (run `ollama serve`)",
         "chat_backend": "agent",
         "embed_backend": "local",
         "embed_device": "cpu",

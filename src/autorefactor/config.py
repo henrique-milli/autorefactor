@@ -110,7 +110,7 @@ class AutorefactorConfig(BaseSettings):
     @field_validator("local_chat", mode="before")
     @classmethod
     def _coerce_local_chat(cls, value: object) -> bool | None:
-        """Compose often injects AUTOREFACTOR_LOCAL_CHAT= (empty) — treat as unset."""
+        """Empty string env injection (AUTOREFACTOR_LOCAL_CHAT=) — treat as unset."""
         if value is None or value == "":
             return None
         if isinstance(value, bool):
@@ -195,7 +195,7 @@ class AutorefactorConfig(BaseSettings):
 
     def resolved_profile(self) -> str:
         raw = (self.profile or os.environ.get("AUTOREFACTOR_PROFILE") or "light").strip().lower()
-        if raw in {"full", "complete", "docker"}:
+        if raw in {"full", "complete"}:
             return "full"
         return "light"
 

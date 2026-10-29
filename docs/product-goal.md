@@ -12,9 +12,7 @@ Autorefactor is an **agent-usable refactor queue**, not a click farm.
 
 ## Out of scope
 
-- Extra always-HITL gates for persona flavor, “never autorun,” or “never auto_proceed `ensure_tests`.”
+- Extra always-HITL gates for cosmetic flavor, “never autorun,” or “never auto_proceed `ensure_tests`.”
 - Confidence caps as a substitute for judgment kinds.
 - New sensors without a product-surface miss (report/queue/MCP).
 - Subject-repo refactors, playbook essays, and sticky changeset-id chasing.
-
-Eval probes check **spec acceptance** (prep exists, secrets stay HITL) — not “every prep item is HITL.”
