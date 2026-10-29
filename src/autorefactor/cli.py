@@ -158,7 +158,7 @@ def init_cmd(
     console.print("[bold]autorefactor init[/bold]")
     base_url = typer.prompt("OpenAI-compatible base URL", default="https://api.openai.com/v1")
     api_key = typer.prompt("API key (chat+embed, leave empty for local/no-auth)", default="", hide_input=True)
-    llm_model = typer.prompt("Chat model", default="gpt-5.6-luna")
+    llm_model = typer.prompt("Chat model", default="gpt-6-luna")
     embed_model = typer.prompt("Embedding model", default="text-embedding-3-small")
     describe_mode = typer.prompt("describe_mode (raw|describe)", default="raw")
     confidence = float(typer.prompt("confidence_threshold", default="0.6"))

@@ -48,7 +48,7 @@ OLLAMA_BASE_URL = "http://ollama:11434/v1"
 DEFAULT_LOCAL_LLM_MODEL = "gemma4:e2b"
 DEFAULT_LOCAL_EMBED_MODEL = "nomic-embed-text"
 DEFAULT_LOCAL_EMBED_GPU_MODEL = "qwen3-embedding:0.6b"
-DEFAULT_CLOUD_LLM_MODEL = "gpt-5.6-luna"
+DEFAULT_CLOUD_LLM_MODEL = "gpt-6-luna"
 DEFAULT_CLOUD_EMBED_MODEL = "text-embedding-3-small"
 DEFAULT_HTTP_EMBED_CONCURRENCY = 4
 
@@ -361,7 +361,11 @@ class AutorefactorConfig(BaseSettings):
         if (
             self.resolved_chat_axis() == "http"
             and not self.uses_local_chat()
-            and (self.llm_model in {"gpt-5.6-terra", "gpt-4o-mini", "gpt-4o"} or not self.llm_model)
+            and (
+                self.llm_model
+                in {"gpt-5.6-terra", "gpt-5.6-luna", "gpt-4o-mini", "gpt-4o"}
+                or not self.llm_model
+            )
         ):
             updates["llm_model"] = DEFAULT_CLOUD_LLM_MODEL
 
@@ -423,6 +427,7 @@ class AutorefactorConfig(BaseSettings):
                 "gpt-4o-mini",
                 "gpt-4o",
                 "gpt-5.6-terra",
+                "gpt-5.6-luna",
                 "gemini-2.0-flash",
                 "gemini-2.5-flash",
                 "gemini-flash-latest",

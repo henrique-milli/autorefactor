@@ -19,7 +19,7 @@ Axes (Settings or `AUTOREFACTOR_*` env):
 | Local chat | `gemma4:e2b` |
 | Local embed (CPU) | `nomic-embed-text` |
 | Local embed (GPU) | `qwen3-embedding:0.6b` |
-| Cloud chat | `gpt-5.6-luna` |
+| Cloud chat | `gpt-6-luna` |
 | Cloud embed | `text-embedding-3-small` |
 
 ## Running
