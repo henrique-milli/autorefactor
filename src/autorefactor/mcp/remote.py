@@ -326,6 +326,9 @@ def ensure_remote_workspace(*, path: str | None = None, force: bool = False) -> 
         and _last_sync_fingerprint == fp
         and (now - _last_sync_at) < 30
     ):
+        # Unchanged tree — keep the skip window fresh so bursty queue ops
+        # (confirm/mark loops) don't re-upload on a stale 30s boundary.
+        _last_sync_at = now
         return {
             "ok": True,
             "skipped": True,

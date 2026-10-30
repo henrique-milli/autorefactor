@@ -30,17 +30,43 @@ _SKIP_DIR = {
 
 
 def repo_fingerprint(repo: Path) -> str:
-    """Stable-ish fingerprint from relative paths + size + mtime (fast)."""
+    """Stable-ish fingerprint from relative paths + size + mtime (fast, pruned walk).
+
+    Prunes skip/dot directories *while* walking: an rglob-then-filter walk still
+    enumerates node_modules (seconds on real workspaces) just to discard it.
+    Hashed file set and ordering are identical to the old filter semantics.
+    """
     h = hashlib.sha256()
     root = repo.resolve()
     if not root.is_dir():
         return h.hexdigest()
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
+    paths: list[Path] = []
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = sorted(current.iterdir())
+        except OSError:
             continue
-        rel_parts = path.relative_to(root).parts
-        if any(p in _SKIP_DIR or p.startswith(".") for p in rel_parts[:-1]):
-            continue
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    # pathlib.rglob does not descend symlinked dirs; a symlink to a
+                    # file still counts (stat follows the target).
+                    if entry.is_file():
+                        paths.append(entry)
+                elif entry.is_dir():
+                    if entry.name in _SKIP_DIR or entry.name.startswith("."):
+                        continue
+                    stack.append(entry)
+                elif entry.is_file():
+                    rel_parts = entry.relative_to(root).parts
+                    if any(p in _SKIP_DIR or p.startswith(".") for p in rel_parts[:-1]):
+                        continue
+                    paths.append(entry)
+            except OSError:
+                continue
+    for path in sorted(paths):
         try:
             st = path.stat()
         except OSError:
